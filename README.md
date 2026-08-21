@@ -1,0 +1,82 @@
+# 🤖 WhatsApp Bot com IA
+
+Bot de WhatsApp que responde mensagens automaticamente usando LLM local gratuito
+(9router), construído sobre a [Evolution API v2](https://doc.evolution-api.com).
+
+## Arquitetura
+
+```
+WhatsApp ⇄ Evolution API (Docker: :8083)
+              │ webhook MESSAGES_UPSERT
+              ▼
+         bot.py (:8084, systemd user service)
+              │ OpenAI-compatible
+              ▼
+         9router (:20131) → LLM gratuito
+```
+
+| Componente | Tecnologia |
+|---|---|
+| Gateway WhatsApp | Evolution API 2.3.7 (Baileys) + Postgres 15 + Redis 7 (Docker Compose) |
+| Bot | Python 3.14 + aiohttp (única dependência) |
+| IA | 9router local — modelo default `ollama/gpt-oss:120b` |
+
+## Setup
+
+```bash
+# 1. Subir a Evolution API
+docker compose up -d
+
+# 2. Configurar .env (ver seção abaixo) e criar instância + conectar número
+curl -X POST http://localhost:8083/instance/create \
+  -H 'apikey: <API_KEY>' -H 'Content-Type: application/json' \
+  -d '{"instanceName":"bot_ia","integration":"WHATSAPP-BAILEYS"}'
+
+# Pareamento por código (mais confiável que QR):
+curl -H 'apikey: <API_KEY>' 'http://localhost:8083/instance/connect/bot_ia?number=5511956470308'
+# → digite o pairingCode no app: Dispositivos conectados → Conectar c/ número
+
+# 3. Apontar o webhook para o bot
+curl -X POST http://localhost:8083/webhook/set/bot_ia \
+  -H 'apikey: <API_KEY>' -H 'Content-Type: application/json' \
+  -d '{"webhook":{"enabled":true,"url":"http://172.17.0.1:8084/webhook","events":["MESSAGES_UPSERT"]}}'
+
+# 4. Instalar e ativar o serviço do bot
+pip install -r requirements.txt
+cp bot.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now whatsapp-bot
+```
+
+## Variáveis de ambiente (bot.py)
+
+| Var | Default | Descrição |
+|---|---|---|
+| `EVOLUTION_URL` | `http://localhost:8083` | Endereço da Evolution API |
+| `EVOLUTION_API_KEY` | `evolution_bot_2026_key` | apikey da Evolution |
+| `EVOLUTION_INSTANCE` | `bot_ia` | Nome da instância |
+| `AI_URL` | `http://localhost:20131/v1/chat/completions` | Endpoint OpenAI-compatível |
+| `AI_MODEL` | `9router/ollama/gpt-oss:120b` | Modelo de resposta |
+| `SYSTEM_PROMPT` | assistente PT-BR conciso | Persona do bot |
+| `RESPOND_IN_GROUPS` | `false` | Responder em grupos (com menção) |
+| `REPLY_DELAY_MS` | `1200` | Delay "digitando..." antes de responder |
+
+## Comportamento
+
+- ✅ Responde mensagens de texto em chats privados
+- 👥 Grupos: ignorados por padrão (`RESPOND_IN_GROUPS=true` responde quando mencionado)
+- 🛡️ Anti-loop: ignora mensagens próprias (`fromMe`) + dedup por id de mensagem
+- 🧠 Histórico de conversa por chat (últimas 12 trocas, em memória)
+- 😅 Mensagens de mídia recebem aviso amigável "só entendo texto"
+
+## Comandos úteis
+
+```bash
+systemctl --user status whatsapp-bot     # estado do serviço
+journalctl --user -u whatsapp-bot -f     # logs ao vivo
+docker compose ps                        # containers
+curl localhost:8084/health               # healthcheck do bot
+```
+
+## Licença
+
+MIT

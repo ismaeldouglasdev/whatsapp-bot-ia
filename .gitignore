@@ -1,0 +1,13 @@
+# Segredos — NUNCA commitar
+.env
+*.key
+cookies.txt
+
+# Runtime
+bot.log
+qr_bot_ia.png
+__pycache__/
+*.pyc
+
+# Lembretes locais
+📅_*

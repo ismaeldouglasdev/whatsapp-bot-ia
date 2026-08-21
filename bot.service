@@ -1,0 +1,13 @@
+[Unit]
+Description=Bot WhatsApp com IA (Evolution API + 9router)
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ismaeldev/Desktop/code_study/MeusProjetos/whatsapp-bot
+ExecStart=/usr/bin/python3 /home/ismaeldev/Desktop/code_study/MeusProjetos/whatsapp-bot/bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
