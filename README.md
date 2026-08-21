@@ -68,6 +68,32 @@ systemctl --user daemon-reload && systemctl --user enable --now whatsapp-bot
 - 🧠 Histórico de conversa por chat (últimas 12 trocas, em memória)
 - 😅 Mensagens de mídia recebem aviso amigável "só entendo texto"
 
+## 🛡️ Guardrails anti-ban
+
+Número de WhatsApp que se comporta como bot recebe ban. O bot tem múltiplas
+camadas de proteção — todas ativas por padrão:
+
+| Proteção | Default (warm-up) | Descrição |
+|---|---|---|
+| `WARMUP` | `true` | Regime conservador para número novo/jovem |
+| `DAILY_SEND_CAP` | 25 (`false`: 150) | Máximo de mensagens enviadas por dia |
+| `HOURLY_SEND_CAP` | 6 (`false`: 25) | Máximo global por hora |
+| `PER_CHAT_HOURLY_CAP` | 4 (`false`: 8) | Máximo por chat/hora |
+| `NEW_CONTACT_DAILY_CAP` | 3 (`false`: 5) | Contato novo tem teto próprio até "amadurecer" |
+| `MIN_REPLY_GAP_S` | 20s | Intervalo mínimo entre respostas no mesmo chat |
+| `ACTIVE_HOURS` | `8-23` | Fora desse horário não responde (bot às 3h = automação) |
+| `MAX_REPLY_CHARS` | 900 | Respostas curtas (textão = spam) |
+| `ALLOW_LINKS` | `false` | **Remove links** das respostas da IA (maior gatilho de ban) |
+| Delay humanizado | ~1.2-5.7s | "Digitando..." proporcional ao tamanho + jitter ±20% |
+| Opt-out LGPD | — | Contato manda `parar/sair/stop` → blacklist persistente; `voltar` reativa |
+
+Contadores diários, blacklist e maturidade de contatos ficam em `state.json`
+(sobrevivem a restart — um reboot não zera os limites).
+
+**Recomendação:** mantenha `WARMUP=true` pelas primeiras semanas. Para
+"graduar" o número, troque para `WARMUP=false` no service do systemd
+(`Environment=WARMUP=false`) e reinicie.
+
 ## Comandos úteis
 
 ```bash
