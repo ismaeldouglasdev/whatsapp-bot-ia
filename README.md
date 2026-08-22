@@ -63,10 +63,30 @@ systemctl --user daemon-reload && systemctl --user enable --now whatsapp-bot
 ## Comportamento
 
 - ✅ Responde mensagens de texto em chats privados
-- 👥 Grupos: ignorados por padrão (`RESPOND_IN_GROUPS=true` responde quando mencionado)
+- 👥 Grupos: responde **somente quando o bot é mencionado** (`@bot` no texto ou
+  na legenda de mídia); sem menção, ignora silenciosamente (`RESPOND_IN_GROUPS=false`
+  desliga grupos por completo)
 - 🛡️ Anti-loop: ignora mensagens próprias (`fromMe`) + dedup por id de mensagem
 - 🧠 Histórico de conversa por chat (últimas 12 trocas, em memória)
-- 😅 Mensagens de mídia recebem aviso amigável "só entendo texto"
+- 😅 Mensagens sem texto/mídia suportada são ignoradas silenciosamente
+- 🎨 Imagem/vídeo → figurinha (ver seção acima); figurinha citada + menção → reenvia com seu pack
+
+## 🎨 Figurinhas (imagens, vídeos e figurinhas citadas)
+
+Mande uma **imagem** ou **vídeo curto** para o bot e ele responde com uma
+figurinha pronta — em grupos, **só quando você mencionar o bot** (@menção,
+inclusive na legenda). Responder uma figurinha citando o bot também funciona.
+
+| Recurso | Detalhe |
+|---|---|
+| Formato | WebP 512×512 |
+| Enquadramento | **Crop 1:1** centralizado (`STICKER_MODE=crop`) ou letterbox (`full`) |
+| Metadados do pack | EXIF injetado na posição que o WhatsApp lê (chunk após VP8X) — nome do pack aparece ao tocar na figurinha |
+| Vídeos | ffmpeg → WebP animado 15fps, máx `STICKER_MAX_VIDEO_S` (8s) |
+| Pack padrão | `STICKER_PACK_NAME=ismaeldev-bot`, autor `ismaeldev` |
+
+Pipeline: base64 do webhook → Pillow (crop/scale) ou ffmpeg (vídeo) →
+remux EXIF → `POST /message/sendSticker`.
 
 ## 🛡️ Guardrails anti-ban
 

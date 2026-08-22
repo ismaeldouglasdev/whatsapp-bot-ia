@@ -12,11 +12,15 @@ Config por variáveis de ambiente (defaults conservadores abaixo).
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import io
 import json
 import logging
 import os
 import random
 import re
+import tempfile
 import time
 from collections import defaultdict, deque
 from datetime import datetime
@@ -24,6 +28,7 @@ from pathlib import Path
 
 import aiohttp
 from aiohttp import web
+from PIL import Image
 
 # ---------------------------------------------------------------------------
 # Configuração
@@ -65,6 +70,15 @@ CONTACT_MATURITY_DAYS = float(os.environ.get("CONTACT_MATURITY_DAYS", "3"))
 OPT_OUT_RE = re.compile(r"^\s*/?(sair|parar|stop|descadastrar|remover)\s*$", re.I)
 OPT_IN_RE = re.compile(r"^\s*/?(voltar|start|optin)\s*$", re.I)
 LINK_RE = re.compile(r"https?://\S+|www\.\S+", re.I)
+
+# --- Figurinhas -------------------------------------------------------------
+STICKER_ENABLED = os.environ.get("STICKER_ENABLED", "true").lower() == "true"
+STICKER_PACK_NAME = os.environ.get("STICKER_PACK_NAME", "ismaeldev-bot")
+STICKER_AUTHOR = os.environ.get("STICKER_AUTHOR", "ismaeldev")
+STICKER_SIZE = int(os.environ.get("STICKER_SIZE", "512"))
+STICKER_MODE = os.environ.get("STICKER_MODE", "crop")  # crop | full
+STICKER_MAX_VIDEO_S = int(os.environ.get("STICKER_MAX_VIDEO_S", "8"))
+FFMPEG = os.environ.get("FFMPEG_PATH", "ffmpeg")
 
 log = logging.getLogger("wabot")
 
@@ -218,20 +232,143 @@ def extract_text(message: dict | None) -> str | None:
     return None
 
 
+def extract_image_b64(message: dict | None) -> str | None:
+    if not isinstance(message, dict):
+        return None
+    # Evolution injeta a mídia em message.base64 (irmão de imageMessage)
+    b64 = message.get("base64")
+    if isinstance(b64, str) and b64:
+        return b64
+    im = message.get("imageMessage")
+    if isinstance(im, dict):
+        b64 = im.get("base64") or ""
+        if b64:
+            return b64
+    return None
+
+
+def is_image_message(message: dict | None) -> bool:
+    return isinstance(message, dict) and isinstance(message.get("imageMessage"), dict)
+
+
+def is_video_message(message: dict | None) -> bool:
+    return isinstance(message, dict) and isinstance(message.get("videoMessage"), dict)
+
+
+def extract_quoted_sticker_b64(message: dict | None) -> str | None:
+    """Base64 de figurinha citada (resposta), quando a Evolution a traz."""
+    if not isinstance(message, dict):
+        return None
+    for key in ("extendedTextMessage", "imageMessage", "videoMessage"):
+        node = message.get(key)
+        if not isinstance(node, dict):
+            continue
+        quoted = ((node.get("contextInfo") or {}).get("quotedMessage")) or {}
+        st = quoted.get("stickerMessage")
+        if isinstance(st, dict):
+            b64 = st.get("base64")
+            if isinstance(b64, str) and b64:
+                return b64
+    return None
+
+
+async def download_media(session: aiohttp.ClientSession, data: dict) -> str | None:
+    """Baixa mídia via API quando o webhook não trouxe base64."""
+    try:
+        async with session.post(
+            f"{EVOLUTION_URL}/message/downloadMedia/{INSTANCE}",
+            json={"message": data},
+            headers={"apikey": EVOLUTION_API_KEY},
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            body = await resp.json(content_type=None)
+            if resp.status == 200:
+                return body.get("base64") or None
+            log.error("downloadMedia HTTP %s: %s", resp.status, str(body)[:200])
+    except Exception as exc:  # noqa: BLE001
+        log.error("downloadMedia erro: %s", exc)
+    return None
+
+
+def extract_media_url(data: dict | None) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    for node in (
+        data.get("mediaUrl"),
+        (data.get("message") or {}).get("mediaUrl") if isinstance(data.get("message"), dict) else None,
+        ((data.get("message") or {}).get("imageMessage") or {}).get("mediaUrl")
+        if isinstance(data.get("message"), dict)
+        else None,
+    ):
+        if isinstance(node, str) and node.startswith("http"):
+            return node
+    return None
+
+
+async def fetch_media_url(session: aiohttp.ClientSession, url: str) -> str | None:
+    """Baixa a mídia do MinIO/S3 (mediaUrl do webhook) e devolve em base64."""
+    host_url = url.replace("http://minio:9000", "http://localhost:9000").replace(
+        "https://minio:9000", "http://localhost:9000"
+    )
+    try:
+        async with session.get(host_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            if resp.status == 200:
+                return base64.b64encode(await resp.read()).decode()
+            log.error("fetch mediaUrl HTTP %s (%s)", resp.status, host_url[:120])
+    except Exception as exc:  # noqa: BLE001
+        log.error("fetch mediaUrl erro: %s", exc)
+    return None
+
+
 def is_group(remote_jid: str) -> bool:
     return remote_jid.endswith("@g.us")
 
 
-RESPOND_IN_GROUPS = os.environ.get("RESPOND_IN_GROUPS", "false").lower() == "true"
+RESPOND_IN_GROUPS = os.environ.get("RESPOND_IN_GROUPS", "true").lower() == "true"
+
+_own_jid: str | None = None
 
 
-def was_mentioned(data: dict) -> bool:
+async def get_own_jid(session: aiohttp.ClientSession) -> str | None:
+    """JID da própria instância (para detectar menções ao bot em grupos)."""
+    global _own_jid
+    if _own_jid:
+        return _own_jid
+    try:
+        async with session.get(
+            f"{EVOLUTION_URL}/instance/fetchInstances",
+            headers={"apikey": EVOLUTION_API_KEY},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            data = await resp.json(content_type=None)
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if isinstance(item, dict) and item.get("instanceName") == INSTANCE:
+                    _own_jid = item.get("ownerJid") or None
+                    break
+    except Exception as exc:  # noqa: BLE001
+        log.error("fetchInstances falhou: %s", exc)
+    if _own_jid:
+        log.info("JID do bot resolvido: %s", _own_jid)
+    return _own_jid
+
+
+def _mentions_own_jid(data: dict, own_jid: str | None) -> bool:
+    """Verifica menções em qualquer contextInfo (texto, legenda de mídia etc.)."""
     msg = data.get("message") or {}
-    ctx = ((msg.get("extendedTextMessage") or {}).get("contextInfo")) or {}
-    mentioned = ctx.get("mentionedJidArray") or ctx.get("mentionedJid") or []
-    if isinstance(mentioned, str):
-        mentioned = [mentioned]
-    return bool(mentioned)
+    mentioned: list[str] = []
+    for key in ("extendedTextMessage", "imageMessage", "videoMessage", "documentMessage"):
+        node = msg.get(key)
+        if not isinstance(node, dict):
+            continue
+        ctx = node.get("contextInfo")
+        if not isinstance(ctx, dict):
+            continue
+        raw = ctx.get("mentionedJidArray") or ctx.get("mentionedJid") or []
+        mentioned.extend(raw if isinstance(raw, list) else [raw])
+    if own_jid is None:
+        return bool(mentioned)  # sem JID conhecido, qualquer menção conta
+    return any(j == own_jid for j in mentioned if isinstance(j, str))
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +431,149 @@ async def send_whatsapp(
             raise RuntimeError(f"sendText HTTP {resp.status}: {str(body)[:300]}")
 
 
+def _sticker_exif(pack_name: str, author: str) -> bytes:
+    """Bloco TIFF/EXIF com metadados de pack de figurinha do WhatsApp.
+
+    Estrutura canônica (mesma do wa-sticker-formatter): IFD com tag 0x5741
+    apontando para o JSON {sticker-pack-name, sticker-pack-publisher, ...}.
+    """
+    meta = {
+        "sticker-pack-id": "ismaeldev.bot",
+        "sticker-pack-name": pack_name,
+        "sticker-pack-publisher": author,
+    }
+    json_buf = json.dumps(meta, ensure_ascii=False).encode()
+    buf = bytearray(
+        bytes(
+            [
+                0x49, 0x49, 0x2A, 0x00,
+                0x08, 0x00, 0x00, 0x00,
+                0x01, 0x00,
+                0x41, 0x57, 0x07, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+                0x16, 0x00, 0x00, 0x00,
+            ]
+        )
+        + json_buf
+    )
+    buf[14:18] = len(json_buf).to_bytes(4, "little")
+    return bytes(buf)
+
+
+def _mux_exif_after_vp8x(webp: bytes, exif: bytes) -> bytes:
+    """Reinsere o chunk EXIF logo após o VP8X — posição que o WhatsApp lê.
+
+    O Pillow grava o EXIF no fim do arquivo; o WhatsApp só mostra o pack
+    quando o chunk vem antes dos chunks de imagem.
+    """
+    if webp[:4] != b"RIFF" or webp[8:12] != b"WEBP":
+        raise ValueError("não é um WebP RIFF válido")
+    pos = 12
+    chunks: list[tuple[bytes, bytes]] = []
+    while pos + 8 <= len(webp):
+        fourcc = webp[pos : pos + 4]
+        size = int.from_bytes(webp[pos + 4 : pos + 8], "little")
+        chunks.append((fourcc, webp[pos + 8 : pos + 8 + size]))
+        pos += 8 + size + (size & 1)
+
+    rebuilt: list[tuple[bytes, bytes]] = []
+    inserted = False
+    for fourcc, payload in chunks:
+        if fourcc == b"EXIF":
+            continue
+        rebuilt.append((fourcc, payload))
+        if fourcc == b"VP8X":
+            rebuilt.append((b"EXIF", exif))
+            inserted = True
+    if not inserted:
+        rebuilt.insert(1, (b"EXIF", exif))
+
+    body = b""
+    for fourcc, payload in rebuilt:
+        body += fourcc
+        body += len(payload).to_bytes(4, "little")
+        body += payload
+        if len(payload) & 1:
+            body += b"\x00"
+    return b"RIFF" + (4 + len(body)).to_bytes(4, "little") + b"WEBP" + body
+
+
+def _square_crop(img: Image.Image) -> Image.Image:
+    """Recorta o centro da imagem para 1:1 e escala para o tamanho final."""
+    w, h = img.size
+    side = min(w, h)
+    left = (w - side) // 2
+    top = (h - side) // 2
+    img = img.crop((left, top, left + side, top + side))
+    return img.resize((STICKER_SIZE, STICKER_SIZE), Image.Resampling.LANCZOS)
+
+
+def make_sticker_raw(media_b64: str) -> bytes:
+    """Imagem/vídeo (base64) → WebP 512x512 com EXIF de pack na posição correta."""
+    if media_b64.strip().startswith("data:"):
+        _, _, media_b64 = media_b64.partition(",")
+    img = Image.open(io.BytesIO(base64.b64decode(media_b64))).convert("RGBA")
+
+    if STICKER_MODE == "crop" or (img.width == img.height):
+        canvas = _square_crop(img)
+    else:
+        img.thumbnail((STICKER_SIZE - 12, STICKER_SIZE - 12), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGBA", (STICKER_SIZE, STICKER_SIZE), (0, 0, 0, 0))
+        canvas.paste(img, ((STICKER_SIZE - img.width) // 2, (STICKER_SIZE - img.height) // 2))
+
+    out = io.BytesIO()
+    canvas.save(out, "WEBP", quality=90, method=4)
+    return _mux_exif_after_vp8x(out.getvalue(), _sticker_exif(STICKER_PACK_NAME, STICKER_AUTHOR))
+
+
+async def make_video_sticker_raw(video_b64: str) -> bytes:
+    """Vídeo curto (base64 mp4) → WebP animado 512x512 com EXIF."""
+    if video_b64.strip().startswith("data:"):
+        _, _, video_b64 = video_b64.partition(",")
+    vf = (
+        f"fps=15,scale={STICKER_SIZE}:{STICKER_SIZE}"
+        ":force_original_aspect_ratio=increase,crop="
+        f"{STICKER_SIZE}:{STICKER_SIZE},scale={STICKER_SIZE}:{STICKER_SIZE}"
+    )
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.mp4"
+        outp = Path(td) / "out.webp"
+        inp.write_bytes(base64.b64decode(video_b64))
+        proc = await asyncio.create_subprocess_exec(
+            FFMPEG,
+            "-y", "-i", str(inp),
+            "-t", str(STICKER_MAX_VIDEO_S),
+            "-vf", vf,
+            "-c:v", "libwebp",
+            "-quality", "80",
+            "-loop", "0",
+            "-an",
+            str(outp),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0 or not outp.exists():
+            tail = (stderr or b"").decode(errors="replace")[-300:]
+            raise RuntimeError(f"ffmpeg falhou: {tail}")
+        raw = outp.read_bytes()
+    return _mux_exif_after_vp8x(raw, _sticker_exif(STICKER_PACK_NAME, STICKER_AUTHOR))
+
+
+async def send_sticker(
+    session: aiohttp.ClientSession, number: str, sticker_b64: str, delay_ms: int
+) -> None:
+    url = f"{EVOLUTION_URL}/message/sendSticker/{INSTANCE}"
+    headers = {"apikey": EVOLUTION_API_KEY}
+    payload = {"number": number, "sticker": sticker_b64, "delay": delay_ms}
+    async with session.post(
+        url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=60)
+    ) as resp:
+        body = await resp.json(content_type=None)
+        if resp.status not in (200, 201):
+            raise RuntimeError(f"sendSticker HTTP {resp.status}: {str(body)[:300]}")
+
+
 # ---------------------------------------------------------------------------
 # Handler do webhook
 # ---------------------------------------------------------------------------
@@ -319,21 +599,29 @@ async def handle_webhook(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "skipped": "duplicate"})
 
     text = extract_text(data.get("message"))
+    media_b64 = extract_image_b64(data.get("message"))
+    has_img = is_image_message(data.get("message"))
+    has_video = is_video_message(data.get("message"))
+    quoted_sticker = extract_quoted_sticker_b64(data.get("message"))
     push_name = data.get("pushName") or remote_jid.split("@")[0]
     _contact(remote_jid)["total_in"] += 1
 
     if is_group(remote_jid):
-        if not RESPOND_IN_GROUPS or not was_mentioned(data):
-            log.info("[grupo ignorado] %s: %r", push_name, (text or "")[:60])
+        if not RESPOND_IN_GROUPS:
+            log.info("[grupo desativado] %s", push_name)
             return web.json_response({"ok": True, "skipped": "group"})
+        own = await get_own_jid(request.app["http"])
+        if not _mentions_own_jid(data, own):
+            log.info("[grupo sem menção] %s: %r", push_name, (text or "")[:60])
+            return web.json_response({"ok": True, "skipped": "group-no-mention"})
 
-    if not text:
-        log.info("[%s] mensagem sem texto", push_name)
-        return web.json_response({"ok": True, "skipped": "no-text"})
+    if not text and not has_img and not has_video and not quoted_sticker:
+        log.info("[%s] mensagem sem conteúdo suportado", push_name)
+        return web.json_response({"ok": True, "skipped": "no-content"})
     _save_state()
 
     # --- Opt-out / opt-in (LGPD + boa prática) ------------------------------
-    if OPT_OUT_RE.match(text):
+    if text and OPT_OUT_RE.match(text):
         if remote_jid not in _state["blacklist"]:
             _state["blacklist"].append(remote_jid)
             _save_state()
@@ -342,7 +630,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
             )
         return web.json_response({"ok": True, "action": "optout"})
 
-    if OPT_IN_RE.match(text) and remote_jid in _state["blacklist"]:
+    if text and OPT_IN_RE.match(text) and remote_jid in _state["blacklist"]:
         _state["blacklist"].remove(remote_jid)
         _save_state()
         await _try_send(request, remote_jid, "Que bom te ver de volta! ✅")
@@ -361,6 +649,54 @@ async def handle_webhook(request: web.Request) -> web.Response:
     if reason:
         log.warning("[RATE LIMIT: %s] mensagem de %s ignorada", reason, push_name)
         return web.json_response({"ok": True, "skipped": f"rate:{reason}"})
+
+    # --- Figurinha (mídia recebida ou figurinha citada) ----------------------
+    if (has_img or has_video or quoted_sticker) and STICKER_ENABLED:
+        media_b64 = quoted_sticker or media_b64
+        media_kind = "figurinha citada" if quoted_sticker else ("vídeo" if has_video else "imagem")
+        if not media_b64:
+            log.info("[DEBUG] mídia sem base64 | mediaUrl=%s", bool(extract_media_url(data)))
+        media_b64 = (
+            media_b64
+            or await download_media(request.app["http"], data)
+            or await fetch_media_url(request.app["http"], extract_media_url(data) or "")
+        )
+        if not media_b64:
+            log.error("mídia sem base64 e sem mediaUrl acessível")
+            await _try_send(request, remote_jid, "Não consegui baixar essa mídia 😅")
+            return web.json_response({"ok": False, "error": "no-media"}, status=502)
+        try:
+            if has_video and not quoted_sticker:
+                sticker_raw = await make_video_sticker_raw(media_b64)
+            else:
+                sticker_raw = make_sticker_raw(media_b64)
+            sticker_b64 = base64.b64encode(sticker_raw).decode()
+        except Exception as exc:  # noqa: BLE001
+            log.error("erro ao gerar figurinha: %s", exc)
+            await _try_send(request, remote_jid, "Não consegui converter essa mídia em figurinha 😅")
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        sent = False
+        try:
+            await send_sticker(
+                request.app["http"],
+                remote_jid.split("@")[0],
+                sticker_b64,
+                humanize_delay_ms("figurinha"),
+            )
+            sent = True
+        except Exception as exc:  # noqa: BLE001
+            log.error("erro ao enviar figurinha: %s", exc)
+        if sent:
+            _register_send(remote_jid)
+            log.info(
+                "→ figurinha enviada (%s) | enviados hoje: %d/%d",
+                STICKER_AUTHOR, _state["sent_today"], DAILY_SEND_CAP,
+            )
+            return web.json_response({"ok": True, "action": "sticker"})
+        return web.json_response({"ok": False, "error": "falha ao enviar figurinha"}, status=502)
+
+    if not text:
+        return web.json_response({"ok": True, "skipped": "no-text"})
 
     log.info("[%s] %s", push_name, text[:120])
 

@@ -30,18 +30,34 @@ services:
       - evolution_net
 
   evolution_api:
-    image: evoapicloud/evolution-api:latest
+    image: evoapicloud/evolution-api:v2.3.7
     container_name: evolution_api
     restart: unless-stopped
     depends_on:
       - postgres
       - redis
+      - minio
     env_file:
       - .env
     ports:
       - "8083:8083"
     volumes:
       - evolution_instances:/evolution/instances
+    networks:
+      - evolution_net
+
+  minio:
+    image: minio/minio:latest
+    container_name: evolution_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: evolution
+      MINIO_ROOT_PASSWORD: evolution2026
+    ports:
+      - "9000:9000"
+    volumes:
+      - /mnt/data/minio-data:/data
     networks:
       - evolution_net
 
