@@ -47,6 +47,28 @@ AI_TIMEOUT_S = int(os.environ.get("AI_TIMEOUT_S", "90"))
 # Com stream=True o teto é por ociosidade entre chunks, não por tempo total.
 AI_STREAM_IDLE_S = int(os.environ.get("AI_STREAM_IDLE_S", "75"))
 AI_STREAM_TOTAL_S = int(os.environ.get("AI_STREAM_TOTAL_S", "300"))
+
+# --- Resiliencia IA: circuit breaker por modelo ---
+_AI_COOLDOWN_429_S = 90
+_AI_COOLDOWN_SERVER_S = 300
+_AI_COOLDOWN_TIMEOUT_S = 120
+_AI_COOLDOWN_OTHER_S = 30
+_model_cooldown: dict[str, float] = {}
+_degraded_last: dict[str, float] = {}
+_degraded_msgs_hoje = {"date": "", "count": 0}
+
+
+class AiUpstreamError(RuntimeError):
+    """Falha de um modelo upstream, com status HTTP quando conhecido."""
+
+    def __init__(self, msg, status=None, model=None):
+        super().__init__(msg)
+        self.status = status
+        self.model = model
+
+
+class AiUnavailable(RuntimeError):
+    """Todos os modelos da chain falharam ou estao em cooldown."""
 DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
 
 BOT_PORT = int(os.environ.get("BOT_PORT", "8084"))
@@ -776,7 +798,19 @@ async def ask_ai(
     use_history: bool = True,
 ) -> str:
     """Executa query com fallback chain e stats globais por modelo."""
-    models = [m.strip() for m in AI_MODELS.split(",") if m.strip()]
+    now = time.time()
+    chain = [m.strip() for m in AI_MODELS.split(",") if m.strip()]
+    healthy = [m for m in chain if _model_cooldown.get(m, 0) <= now]
+    for m in chain:
+        if m not in healthy:
+            log.info("[IA] %s em cooldown %.0fs - pulando", m, _model_cooldown[m] - now)
+
+    def _ratio(m):
+        s = _ia_stats.get(m) or {}
+        ok = s.get("ok", 0)
+        return ok / max(1, ok + s.get("fail", 0))
+
+    models = sorted(healthy, key=_ratio, reverse=True)
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if use_history:
@@ -803,7 +837,9 @@ async def ask_ai(
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
-                    raise RuntimeError(f"IA HTTP {resp.status}: {body[:200]}")
+                    raise AiUpstreamError(
+                        f"IA HTTP {resp.status}: {body[:200]}", status=resp.status, model=model
+                    )
                 ctype = resp.headers.get("Content-Type", "")
                 if "event-stream" in ctype:
                     content = await _consume_sse_stream(resp)
@@ -819,7 +855,20 @@ async def ask_ai(
                 _ia_last_model = model
                 return content
         except Exception as exc:
-            log.warning("[IA] Modelo %s falhou inesperadamente: %s", model, exc)
+            status = getattr(exc, "status", None)
+            if status == 429:
+                cd = _AI_COOLDOWN_429_S
+            elif status in (402, 500, 502, 503):
+                cd = _AI_COOLDOWN_SERVER_S
+            elif status is None:
+                cd = _AI_COOLDOWN_TIMEOUT_S
+            else:
+                cd = _AI_COOLDOWN_OTHER_S
+            _model_cooldown[model] = time.time() + cd
+            log.warning(
+                "[IA] Modelo %s falhou (HTTP %s) - cooldown %ds: %s",
+                model, status, cd, str(exc)[:120],
+            )
             if model not in _ia_stats:
                 _ia_stats[model] = {"ok": 0, "fail": 0, "last_error": None, "last_ms": None}
             _ia_stats[model]["fail"] += 1
@@ -828,7 +877,7 @@ async def ask_ai(
 
         await asyncio.sleep(1)  # Respeito mínimo entre tentativas
 
-    raise RuntimeError(f"IA falhou para {len(models)} modelos: {last_error}")
+    raise AiUnavailable(f"IA falhou para {len(chain)} modelos: {last_error}")
 
 
 async def send_whatsapp(
@@ -1479,6 +1528,19 @@ async def handle_webhook(request: web.Request) -> web.Response:
     # --- IA + resposta -------------------------------------------------------
     try:
         answer = await ask_ai(request.app["http"], remote_jid, text)
+    except AiUnavailable:
+        today = datetime.now().strftime("%Y-%m-%d")
+        if _degraded_msgs_hoje["date"] != today:
+            _degraded_msgs_hoje.update(date=today, count=0)
+        if time.time() - _degraded_last.get(remote_jid, 0) > 600:
+            _degraded_last[remote_jid] = time.time()
+            _degraded_msgs_hoje["count"] += 1
+            log.error("IA indisponivel para %s - aviso degradado enviado", push_name)
+            await _try_send(
+                request, remote_jid,
+                "\u26a0\ufe0f Minha IA t\u00e1 fora do ar agora. Tenta de novo em alguns minutinhos \U0001F64F",
+            )
+        return web.json_response({"ok": False, "degraded": True})
     except Exception as exc:  # noqa: BLE001
         log.error("erro na IA: %s", exc)
         return web.json_response({"ok": False, "error": str(exc)}, status=502)
@@ -1587,6 +1649,12 @@ async def handle_api_state(request: web.Request) -> web.Response:
             "ia": {
                 "chain": [m.strip() for m in AI_MODELS.split(",") if m.strip()],
                 "models": _ia_stats,
+                "cooldowns": {
+                    m: max(0, int(t - time.time()))
+                    for m, t in _model_cooldown.items()
+                    if t > time.time()
+                },
+                "degraded_msgs_hoje": _degraded_msgs_hoje["count"],
             },
             "contacts": contacts,
             "blacklist": list(_state["blacklist"]),
