@@ -22,6 +22,7 @@ import random
 import re
 import tempfile
 import time
+from collections.abc import Awaitable, Callable
 from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +43,9 @@ AI_MODEL = os.environ.get("AI_MODEL", "9router/ollama/gpt-oss:120b")
 AI_MODELS = os.environ.get("AI_MODELS", "9router/ollama/gpt-oss:120b,9router/nvidia/minimaxai/minimax-m3,groq/llama-3.3-70b-versatile")
 AI_ATTEMPT_TIMEOUT_S = int(os.environ.get("AI_ATTEMPT_TIMEOUT_S", "40"))
 AI_TIMEOUT_S = int(os.environ.get("AI_TIMEOUT_S", "90"))
+# Com stream=True o teto é por ociosidade entre chunks, não por tempo total.
+AI_STREAM_IDLE_S = int(os.environ.get("AI_STREAM_IDLE_S", "75"))
+AI_STREAM_TOTAL_S = int(os.environ.get("AI_STREAM_TOTAL_S", "300"))
 DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
 
 BOT_PORT = int(os.environ.get("BOT_PORT", "8084"))
@@ -744,12 +748,37 @@ async def _extract_ai_content(status_code: int, body_text: str) -> str:
     return content
 
 
-async def ask_ai(session: aiohttp.ClientSession, chat_jid: str, user_text: str) -> str:
+async def _consume_sse_stream(resp: aiohttp.ClientResponse) -> str:
+    """Consome SSE ao vivo; timeout vira ociosidade entre chunks, não tempo total."""
+    content = ""
+    async for raw_line in resp.content:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        try:
+            chunk = json.loads(line.removeprefix("data: ").strip())
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            content += delta.get("content", "")
+        except Exception:
+            continue
+    if not content.strip():
+        raise RuntimeError("IA respondeu em branco (stream)")
+    return content
+
+
+async def ask_ai(
+    session: aiohttp.ClientSession,
+    chat_jid: str,
+    user_text: str,
+    *,
+    use_history: bool = True,
+) -> str:
     """Executa query com fallback chain e stats globais por modelo."""
     models = [m.strip() for m in AI_MODELS.split(",") if m.strip()]
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages += list(_history[chat_jid])
+    if use_history:
+        messages += list(_history[chat_jid])
     messages.append({"role": "user", "content": user_text})
 
     last_error = None
@@ -757,7 +786,7 @@ async def ask_ai(session: aiohttp.ClientSession, chat_jid: str, user_text: str) 
         payload = {
             "model": model,
             "messages": messages,
-            "stream": False,
+            "stream": True,
             "max_tokens": 1024,
             "temperature": 0.7,
         }
@@ -766,10 +795,19 @@ async def ask_ai(session: aiohttp.ClientSession, chat_jid: str, user_text: str) 
             start = time.time()
             async with session.post(
                 AI_URL, json=payload,
-                timeout=aiohttp.ClientTimeout(total=AI_ATTEMPT_TIMEOUT_S),
+                timeout=aiohttp.ClientTimeout(
+                    total=AI_STREAM_TOTAL_S, sock_read=AI_STREAM_IDLE_S
+                ),
             ) as resp:
-                body = await resp.text()
-                content = await _extract_ai_content(resp.status, body)
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RuntimeError(f"IA HTTP {resp.status}: {body[:200]}")
+                ctype = resp.headers.get("Content-Type", "")
+                if "event-stream" in ctype:
+                    content = await _consume_sse_stream(resp)
+                else:
+                    body = await resp.text()
+                    content = await _extract_ai_content(resp.status, body)
                 duration = int((time.time() - start) * 1000)
 
                 # Stats globais do modelo ao responder
@@ -949,6 +987,359 @@ async def send_sticker(
 
 
 # ---------------------------------------------------------------------------
+# Comandos (. ou !) — respostas determinísticas sem inferência
+# ---------------------------------------------------------------------------
+_CMD_RE = re.compile(r"^[.!](\w+)\s*(.*)$", re.DOTALL)
+_games_velha: dict[str, dict] = {}
+_games_forca: dict[str, dict] = {}
+_quiz_state: dict[str, dict] = {}
+_FORCA_WORDS = [
+    "python", "servidor", "abacaxi", "janela", "chuveiro", "girafa", "pipoca",
+    "teclado", "bicicleta", "sorvete", "castelo", "jacare", "violao", "cogumelo",
+    "foguete", "melancia", "guardanapo", "esqueleto", "borracha", "dinossauro",
+]
+_WMO = {
+    0: ("céu limpo", "☀️"), 1: ("quase limpo", "🌤️"), 2: ("parcialmente nublado", "⛅"),
+    3: ("nublado", "☁️"), 45: ("nevoeiro", "🌫️"), 48: ("nevoeiro", "🌫️"),
+    51: ("garoa", "🌦️"), 53: ("garoa", "🌦️"), 55: ("garoa forte", "🌦️"),
+    61: ("chuva fraca", "🌧️"), 63: ("chuva", "🌧️"), 65: ("chuva forte", "🌧️"),
+    71: ("neve", "❄️"), 80: ("pancadas", "🌦️"), 81: ("pancadas", "🌦️"),
+    82: ("pancadas fortes", "⛈️"), 95: ("tempestade", "⛈️"), 96: ("tempestade com granizo", "⛈️"),
+}
+
+MENU_TEXT = (
+    "🤖 *Comandos do bot*\n"
+    "▸ .ping — teste rápido\n"
+    "▸ .info — status do bot\n"
+    "▸ .dolar / .euro / .moedas — cotações\n"
+    "▸ .clima <cidade> — tempo agora\n"
+    "▸ .figtexto <texto> — figurinha de texto\n"
+    "▸ .ppt <pedra|papel|tesoura>\n"
+    "▸ .velha — jogo da velha vs bot (`.velha <1-9>` pra jogar)\n"
+    "▸ .forca — advinhe a palavra (`.forca <letra>`)\n"
+    "▸ .quiz — trivia (responda `.quiz <a-d>`)\n"
+    "\n💬 Sem ponto = conversa com a IA"
+)
+
+
+def _prune_game_state() -> None:
+    cutoff = time.time() - 2 * 3600
+    for store in (_games_velha, _games_forca, _quiz_state):
+        for k in [k for k, v in store.items() if v.get("ts", 0) < cutoff]:
+            del store[k]
+
+
+def _render_velha(board: list[str]) -> str:
+    cells = [c if c != " " else str(i + 1) for i, c in enumerate(board)]
+    rows = []
+    for r in range(3):
+        rows.append(" ".join(cells[r * 3 : r * 3 + 3]))
+    return "```\n{}\n```".format("\n─╂─\n".join(rows))
+
+
+def _velha_winner(b: list[str]) -> str | None:
+    lines = [(0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)]
+    for a, c, d in lines:
+        if b[a] != " " and b[a] == b[c] == b[d]:
+            return b[a]
+    return None
+
+
+def _bot_move(b: list[str]) -> int:
+    def _find(sym: str) -> int | None:
+        lines = [(0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)]
+        for a, c, d in lines:
+            trio = [b[a], b[c], b[d]]
+            if trio.count(sym) == 2 and trio.count(" ") == 1:
+                return (a, c, d)[trio.index(" ")]
+        return None
+
+    move = _find("O") or _find("X")
+    if move is None:
+        free = [i for i, c in enumerate(b) if c == " "]
+        order = [4, 0, 2, 6, 8, 1, 3, 5, 7]
+        move = next((i for i in order if i in free), free[0])
+    return move
+
+
+async def _cmd_ping(request: web.Request, jid: str, args: str) -> None:
+    await _try_send(request, jid, "pong 🏓")
+
+
+async def _cmd_menu(request: web.Request, jid: str, args: str) -> None:
+    await _try_send(request, jid, MENU_TEXT)
+
+
+async def _cmd_info(request: web.Request, jid: str, args: str) -> None:
+    chain = " → ".join(m.strip() for m in AI_MODELS.split(",") if m.strip())
+    await _try_send(
+        request,
+        jid,
+        f"ℹ️ instância `{INSTANCE}`\n"
+        f"🧠 rota: {chain}\n"
+        f"📤 hoje: {_state['sent_today']}/{DAILY_SEND_CAP} (cap {HOURLY_SEND_CAP}/h)\n"
+        f"💬 chats ativos: {len(_history)}",
+    )
+
+
+async def _fetch_json(http: aiohttp.ClientSession, url: str):
+    async with http.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        resp.raise_for_status()
+        return await resp.json(content_type=None)
+
+
+async def _cmd_moedas(request: web.Request, jid: str, args: str, pairs: str = "USD-BRL,EUR-BRL,GBP-BRL,BTC-BRL") -> None:
+    data = await _fetch_json(request.app["http"], f"https://economia.awesomeapi.com.br/json/last/{pairs}")
+    emoji = {"USD": "💵", "EUR": "💶", "GBP": "💷", "BTC": "₿"}
+    lines = []
+    for key, v in data.items():
+        cur = key.replace("BRL", "")
+        pct = float(v.get("pctChange", 0))
+        arrow = "📈" if pct >= 0 else "📉"
+        price = float(v["bid"])
+        val = f"{price:,.2f}" if cur != "BTC" else f"{price:,.0f}"
+        lines.append(f"{emoji.get(cur, '💰')} {cur}: R$ {val} {arrow} {pct:+.2f}%")
+    await _try_send(request, jid, "\n".join(lines))
+
+
+async def _cmd_dolar(request: web.Request, jid: str, args: str) -> None:
+    await _cmd_moedas(request, jid, args, pairs="USD-BRL")
+
+
+async def _cmd_euro(request: web.Request, jid: str, args: str) -> None:
+    await _cmd_moedas(request, jid, args, pairs="EUR-BRL")
+
+
+async def _cmd_clima(request: web.Request, jid: str, args: str) -> None:
+    city = args.strip()
+    if not city:
+        await _try_send(request, jid, "Uso: `.clima <cidade>` (ex.: `.clima São Paulo`)")
+        return
+    geo = await _fetch_json(
+        request.app["http"],
+        f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=pt&format=json",
+    )
+    results = geo.get("results") or []
+    if not results:
+        await _try_send(request, jid, f"Não achei a cidade '{city}' 🤷")
+        return
+    g = results[0]
+    wx = await _fetch_json(
+        request.app["http"],
+        f"https://api.open-meteo.com/v1/forecast?latitude={g['latitude']}&longitude={g['longitude']}"
+        "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code&timezone=auto",
+    )
+    cur = wx.get("current", {})
+    desc, icon = _WMO.get(int(cur.get("weather_code", 0)), ("tempo indefinido", "🌡️"))
+    await _try_send(
+        request,
+        jid,
+        f"{icon} *{g['name']}*{' — ' + g.get('admin1', '') if g.get('admin1') else ''}\n"
+        f"🌡️ {cur.get('temperature_2m', '?')}°C (sensação {cur.get('apparent_temperature', '?')}°C)\n"
+        f"💧 umidade {cur.get('relative_humidity_2m', '?')}%\n"
+        f"{desc}",
+    )
+
+
+async def _cmd_ppt(request: web.Request, jid: str, args: str) -> None:
+    opts = {"pedra": "✊", "papel": "✋", "tesoura": "✌️"}
+    player = args.strip().lower()
+    if player not in opts:
+        await _try_send(request, jid, "Uso: `.ppt pedra|papel|tesoura`")
+        return
+    bot = random.choice(list(opts))
+    beats = {"pedra": "tesoura", "papel": "pedra", "tesoura": "papel"}
+    if player == bot:
+        verdict = "Empate! 🤝"
+    elif beats[player] == bot:
+        verdict = "Você ganhou! 🎉"
+    else:
+        verdict = "Ganhei! 😎"
+    await _try_send(request, jid, f"{opts[player]} vs {opts[bot]}\n{verdict}")
+
+
+async def _cmd_velha(request: web.Request, jid: str, args: str) -> None:
+    game = _games_velha.get(jid)
+    if not game or game.get("done"):
+        game = {"board": [" "] * 9, "ts": time.time(), "done": False}
+        _games_velha[jid] = game
+        await _try_send(request, jid, "🎮 Jogo da velha — você é ❌\n" + _render_velha(game["board"]) + "\nJogue: `.velha <1-9>`")
+        return
+    if not args.strip().isdigit():
+        await _try_send(request, jid, _render_velha(game["board"]) + "\nPosição: `.velha <1-9>`")
+        return
+    pos = int(args.strip()) - 1
+    board = game["board"]
+    if pos < 0 or pos > 8 or board[pos] != " ":
+        await _try_send(request, jid, "Posição inválida ou ocupada 🤨")
+        return
+    board[pos] = "X"
+    winner = _velha_winner(board)
+    if not winner and " " in board:
+        board[_bot_move(board)] = "O"
+        winner = _velha_winner(board)
+    game["ts"] = time.time()
+    if winner or " " not in board:
+        game["done"] = True
+        end = "Você ganhou! 🎉" if winner == "X" else "Ganhei! 😎" if winner == "O" else "Velha! 🤝"
+        await _try_send(request, jid, _render_velha(board) + "\n" + end + "\n`.velha` pra revanche")
+        return
+    await _try_send(request, jid, _render_velha(board) + "\nSua vez: `.velha <1-9>`")
+
+
+async def _cmd_forca(request: web.Request, jid: str, args: str) -> None:
+    game = _games_forca.get(jid)
+    arg = args.strip().lower()
+    if not game or game.get("done"):
+        game = {"word": random.choice(_FORCA_WORDS), "used": set(), "wrong": 0, "ts": time.time(), "done": False}
+        _games_forca[jid] = game
+        await _try_send(request, jid, "🎯 Forca! 6 erros e você perde.\n`" + " ".join("_" * len(game["word"])) + "`\nChute: `.forca <letra>`")
+        return
+    if not arg or len(arg) > 1 or not arg.isalpha():
+        await _try_send(request, jid, "Chute uma letra por vez: `.forca <letra>`")
+        return
+    if arg in game["used"]:
+        await _try_send(request, jid, f"'{arg}' já foi tentada 🙃")
+        return
+    game["used"].add(arg)
+    game["ts"] = time.time()
+    if arg not in game["word"]:
+        game["wrong"] += 1
+    reveal = " ".join(c if c in game["used"] else "_" for c in game["word"])
+    stage = "❤️" * (6 - game["wrong"]) + "🖤" * game["wrong"]
+    if all(c in game["used"] for c in game["word"]):
+        game["done"] = True
+        await _try_send(request, jid, f"🎉 Acertou! A palavra era *{game['word']}*\n`{reveal}`")
+        return
+    if game["wrong"] >= 6:
+        game["done"] = True
+        await _try_send(request, jid, f"💀 Enforcou! A palavra era *{game['word']}*\n`.forca` pra outra")
+        return
+    await _try_send(request, jid, f"`{reveal}`\n{stage}\nErros: {', '.join(sorted(set(game['used']) - set(game['word']))) or '—'}")
+
+
+def _make_text_sticker_raw(text: str) -> bytes:
+    """Texto → figurinha WebP estilo brat (fundo escuro, texto claro)."""
+    from PIL import ImageDraw, ImageFont
+
+    canvas = Image.new("RGBA", (STICKER_SIZE, STICKER_SIZE), random.choice([(24, 24, 27, 255), (15, 46, 35, 255), (40, 18, 38, 255)]))
+    draw = ImageDraw.Draw(canvas)
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    words = text.lower().split()[:24]
+    lines: list[str] = []
+    line_h = 86
+    font = ImageFont.load_default()
+    size = 72
+    while size >= 28:
+        try:
+            font = ImageFont.truetype(font_path, size)
+        except OSError:
+            font = ImageFont.load_default()
+        line_h = size + 14
+        max_chars = max(1, int((STICKER_SIZE - 60) / (size * 0.62)))
+        lines, cur = [], ""
+        for w in words:
+            cand = (cur + " " + w).strip()
+            if len(cand) <= max_chars:
+                cur = cand
+            else:
+                lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        if len(lines) * line_h <= STICKER_SIZE - 80:
+            break
+        size -= 8
+    total_h = len(lines) * line_h
+    y = (STICKER_SIZE - total_h) // 2
+    for ln in lines:
+        w_box = draw.textlength(ln, font=font)
+        draw.text(((STICKER_SIZE - w_box) / 2, y), ln, font=font, fill=(240, 240, 240, 255))
+        y += line_h
+    out = io.BytesIO()
+    canvas.save(out, "WEBP", quality=90, method=4)
+    return _mux_exif_after_vp8x(out.getvalue(), _sticker_exif(STICKER_PACK_NAME, STICKER_AUTHOR))
+
+
+async def _cmd_figtexto(request: web.Request, jid: str, args: str) -> None:
+    txt = args.strip()
+    if not txt:
+        await _try_send(request, jid, "Uso: `.figtexto seu texto aqui`")
+        return
+    sticker_b64 = base64.b64encode(_make_text_sticker_raw(txt)).decode()
+    await send_sticker(request.app["http"], jid.split("@")[0], sticker_b64, humanize_delay_ms("figurinha"))
+    _register_send(jid)
+
+
+QUIZ_PROMPT = (
+    "Gere UMA pergunta de trivia em português sobre qualquer tema variado. "
+    'Responda SOMENTE com JSON válido, sem markdown: {"pergunta": "...", '
+    '"alternativas": {"a": "...", "b": "...", "c": "...", "d": "..."}, "correta": "a|b|c|d"}'
+)
+
+
+async def _cmd_quiz(request: web.Request, jid: str, args: str) -> None:
+    state = _quiz_state.get(jid)
+    ans = args.strip().lower()
+    if state and ans in ("a", "b", "c", "d"):
+        correct = state.get("correta")
+        state["done"] = True
+        verdict = "✅ Acertou!" if ans == correct else f"❌ Era a letra *{correct}*"
+        await _try_send(request, jid, f"{verdict}\n`.quiz` pra próxima")
+        return
+    await _try_send(request, jid, "🎲 Gerando pergunta...")
+    raw = await ask_ai(request.app["http"], jid, QUIZ_PROMPT, use_history=False)
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        raise RuntimeError(f"quiz sem JSON: {raw[:150]}")
+    q = json.loads(match.group(0))
+    alts = q["alternativas"]
+    _quiz_state[jid] = {"correta": str(q["correta"]).lower(), "ts": time.time()}
+    lines = [f"❓ {q['pergunta']}"] + [f"{k}) {v}" for k, v in sorted(alts.items())]
+    lines.append("\nResponda: `.quiz <a-d>`")
+    await _try_send(request, jid, "\n".join(lines))
+
+
+CommandHandler = Callable[[web.Request, str, str], Awaitable[None]]
+
+COMMANDS: dict[str, CommandHandler] = {
+    "menu": _cmd_menu,
+    "start": _cmd_menu,
+    "ping": _cmd_ping,
+    "info": _cmd_info,
+    "dolar": _cmd_dolar,
+    "euro": _cmd_euro,
+    "moedas": _cmd_moedas,
+    "clima": _cmd_clima,
+    "ppt": _cmd_ppt,
+    "velha": _cmd_velha,
+    "forca": _cmd_forca,
+    "figtexto": _cmd_figtexto,
+    "quiz": _cmd_quiz,
+}
+
+
+async def dispatch_command(request: web.Request, remote_jid: str, text: str) -> bool:
+    """Executa comando se a mensagem casar; True = consumida."""
+    m = _CMD_RE.match(text.strip())
+    if not m:
+        return False
+    cmd, args = m.group(1).lower(), m.group(2).strip()
+    fn = COMMANDS.get(cmd)
+    if fn is None:
+        return False
+    _prune_game_state()
+    try:
+        await fn(request, remote_jid, args)
+        _register_send(remote_jid)
+        log.info("→ comando .%s executado | enviados hoje: %d/%d", cmd, _state["sent_today"], DAILY_SEND_CAP)
+    except Exception as exc:  # noqa: BLE001
+        log.error("[cmd .%s] %s", cmd, exc)
+        await _try_send(request, remote_jid, "Deu ruim nesse comando 😅 tenta de novo")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Handler do webhook
 # ---------------------------------------------------------------------------
 async def handle_webhook(request: web.Request) -> web.Response:
@@ -1073,6 +1464,10 @@ async def handle_webhook(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "skipped": "no-text"})
 
     log.info("[%s] %s", push_name, text[:120])
+
+    # --- Comandos (. ou !) — resposta instantânea, sem IA ---------------------
+    if text[:1] in (".", "!") and await dispatch_command(request, remote_jid, text):
+        return web.json_response({"ok": True, "action": "command"})
 
     # --- IA + resposta -------------------------------------------------------
     try:
