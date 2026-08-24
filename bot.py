@@ -1126,7 +1126,10 @@ _WMO = {
 
 MENU_TEXT = (
     "🤖 *Comandos do bot*\n"
-    "▸ .ping — teste rápido\n"    "▸ .reset — limpa o contexto da conversa\n"
+    "▸ .ping — teste rápido\n"    "▸ .reset — limpa o contexto da conversa\n"    "▸ .resumo — cite um texto longo e peça o resumo\n"
+    "▸ .traduz <texto> — tradução automática\n"
+    "▸ .lembrar HH:MM <texto> — lembrete agendado\n"
+    "▸ .piada — uma risada rápida\n"
     "▸ .info — status do bot\n"
     "▸ .dolar / .euro / .moedas — cotações\n"
     "▸ .clima <cidade> — tempo agora\n"
@@ -1428,6 +1431,149 @@ async def _cmd_reset(request: web.Request, jid: str, args: str) -> None:
     )
 
 
+# --- Comandos novos (fase 2) ---
+_last_data: dict[str, dict] = {}
+_app_ref: web.Application | None = None
+
+
+def _quoted_text(data: dict | None) -> str | None:
+    """Texto de mensagem citada (contextInfo.quotedMessage)."""
+    if not isinstance(data, dict):
+        return None
+    msg = data.get("message") or {}
+    ctx = None
+    for k in ("extendedTextMessage", "imageMessage", "videoMessage", "documentMessage"):
+        node = msg.get(k)
+        if isinstance(node, dict) and isinstance(node.get("contextInfo"), dict):
+            ctx = node["contextInfo"]
+            break
+    if not isinstance(ctx, dict):
+        return None
+    q = ctx.get("quotedMessage") or {}
+    conv = q.get("conversation")
+    if isinstance(conv, str) and conv.strip():
+        return conv.strip()
+    ext = q.get("extendedTextMessage") or {}
+    t = ext.get("text")
+    return t.strip() if isinstance(t, str) and t.strip() else None
+
+
+def _fire_reminder_now(number: str, text: str) -> None:
+    captured = []
+
+    async def runner():
+        try:
+            if _app_ref is not None:
+                await send_whatsapp(
+                    _app_ref["http"], number,
+                    f"\u23f0 Lembrete: {text}",
+                    humanize_delay_ms(text),
+                )
+                captured.append(True)
+        except Exception as exc:  # noqa: BLE001
+            log.error("[LEMBRAR] falha ao enviar: %s", exc)
+
+    return runner, captured
+
+
+def _arm_reminder(jid: str, when: float, text: str) -> None:
+    """Agenda o disparo do lembrete (sobrevive ao boot via state)."""
+    number = jid.split("@")[0]
+
+    async def runner():
+        try:
+            await asyncio.sleep(max(0.1, when - time.time()))
+            runner_fn, _ = _fire_reminder_now(number, text)
+            await runner_fn()
+            _state["reminders"] = [
+                r for r in _state.get("reminders", [])
+                if not (abs(r["ts"] - when) < 1 and r["jid"] == jid and r["text"] == text)
+            ]
+            _save_state()
+        except Exception as exc:  # noqa: BLE001
+            log.error("[LEMBRAR] erro no runner: %s", exc)
+
+    t = asyncio.create_task(runner())
+
+
+async def _cmd_resumo(request: web.Request, jid: str, args: str) -> None:
+    q = _quoted_text(_last_data.get(jid))
+    if not q or len(q) < 400:
+        await _try_send(request, jid, "Responda (cite) uma mensagem longa com .resumo que eu faço um resumo 📝")
+        return
+    try:
+        answer = await ask_ai(
+            request.app["http"], jid,
+            "Resuma o texto a seguir em até 3 bullets curtos em PT-BR:\n\n" + q[:4000],
+            use_history=False,
+        )
+    except Exception:  # noqa: BLE001
+        answer = ""
+    if not answer:
+        await _try_send(request, jid, "Deu ruim no resumo 😅 tenta de novo")
+        return
+    await _try_send(request, jid, "📝 " + sanitize_reply(answer))
+
+
+async def _cmd_traduz(request: web.Request, jid: str, args: str) -> None:
+    if not args or len(args) > 1000:
+        await _try_send(request, jid, "Uso: .traduz <texto> (máx 1000 caracteres)")
+        return
+    prompt = (
+        "Detecte o idioma do texto abaixo. Se estiver em português, traduza para inglês. "
+        "Caso contrário, traduza para português brasileiro. Responda APENAS com a tradução:\n\n"
+        + args
+    )
+    try:
+        answer = await ask_ai(request.app["http"], jid, prompt, use_history=False)
+    except Exception:  # noqa: BLE001
+        answer = ""
+    await _try_send(request, jid, (sanitize_reply(answer) or "Não consegui traduzir agora 😅")[:900])
+
+
+_LEMBRAR_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)\s+(.+)$")
+
+
+async def _cmd_lembrar(request: web.Request, jid: str, args: str) -> None:
+    ativos = [r for r in _state.get("reminders", []) if r["jid"] == jid]
+    if not args:
+        if not ativos:
+            await _try_send(request, jid, "Uso: .lembrar HH:MM <texto>")
+            return
+        linhas = "\n".join(
+            f"• {time.strftime('%H:%M', time.localtime(r['ts']))} — {r['text']}"
+            for r in sorted(ativos, key=lambda r: r["ts"])
+        )
+        await _try_send(request, jid, f"⏰ Seus lembretes:\n{linhas}")
+        return
+    m = _LEMBRAR_RE.match(args)
+    if not m:
+        await _try_send(request, jid, "Formato: .lembrar HH:MM <texto>")
+        return
+    hh, mm, txt = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+    when = datetime.now().replace(hour=hh, minute=mm, second=0, microsecond=0).timestamp()
+    if when <= time.time():
+        when += 86400
+    if len(ativos) >= 5:
+        await _try_send(request, jid, "Você já tem 5 lembretes ativos 😅 (.lembrar lista todos)")
+        return
+    _state.setdefault("reminders", []).append({"jid": jid, "ts": when, "text": txt})
+    _save_state()
+    _arm_reminder(jid, when, txt)
+    await _try_send(request, jid, f"⏰ Anotado! Te aviso às {hh:02d}:{mm:02d}.")
+
+
+_PIADA_PROMPT = "Conte uma piada curta e engraçada em PT-BR. Só a piada, sem introdução."
+
+
+async def _cmd_piada(request: web.Request, jid: str, args: str) -> None:
+    try:
+        answer = await ask_ai(request.app["http"], jid, _PIADA_PROMPT, use_history=False)
+    except Exception:  # noqa: BLE001
+        answer = ""
+    await _try_send(request, jid, (sanitize_reply(answer) if answer else "Tô sem piadas agora 😅"))
+
+
 COMMANDS: dict[str, CommandHandler] = {
     "menu": _cmd_menu,
     "start": _cmd_menu,
@@ -1443,6 +1589,10 @@ COMMANDS: dict[str, CommandHandler] = {
     "figtexto": _cmd_figtexto,
     "quiz": _cmd_quiz,
     "reset": _cmd_reset,
+    "resumo": _cmd_resumo,
+    "traduz": _cmd_traduz,
+    "lembrar": _cmd_lembrar,
+    "piada": _cmd_piada,
 }
 
 
@@ -1607,6 +1757,10 @@ async def handle_webhook(request: web.Request) -> web.Response:
     log.info("[%s] %s", push_name, text[:120])
 
     # --- Comandos (. ou !) — resposta instantânea, sem IA ---------------------
+    _last_data[remote_jid] = data
+    if len(_last_data) > 50:
+        for _k in list(_last_data)[:-25]:
+            _last_data.pop(_k, None)
     if text[:1] in (".", "!") and await dispatch_command(request, remote_jid, text, key=key):
         return web.json_response({"ok": True, "action": "command"})
 
@@ -1893,6 +2047,8 @@ async def _poll_instance_state(app: web.Application):
 # Main
 # ---------------------------------------------------------------------------
 async def http_session_ctx(app: web.Application):
+    global _app_ref
+    _app_ref = app
     app["http"] = aiohttp.ClientSession()
     poller = asyncio.create_task(_poll_instance_state(app))
     yield
@@ -1920,6 +2076,8 @@ def main() -> None:
     if not WEBHOOK_TOKEN:
         log.critical("WEBHOOK_TOKEN vazio - /webhook rejeitara TODOS os posts (fail-closed)")
     _load_state()
+    for _r in _state.get("reminders", []):
+        _arm_reminder(_r["jid"], _r["ts"], _r["text"])
     app = web.Application()
     app.cleanup_ctx.append(http_session_ctx)
     app.router.add_post("/webhook", handle_webhook)
