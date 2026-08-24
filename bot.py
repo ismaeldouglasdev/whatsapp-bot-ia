@@ -2145,7 +2145,7 @@ def main() -> None:
         BOT_PORT, INSTANCE, AI_MODEL, WARMUP,
         DAILY_SEND_CAP, HOURLY_SEND_CAP, PER_CHAT_HOURLY_CAP,
     )
-    web.run_app(app, host="0.0.0.0", port=BOT_PORT, print=None)
+    web.run_app(app, host="0.0.0.0", port=BOT_PORT, print=None, client_max_size=64 * 1024 * 1024)
 
 
 if __name__ == "__main__":
