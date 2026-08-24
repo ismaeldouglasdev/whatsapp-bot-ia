@@ -10,6 +10,7 @@ Restart=on-failure
 RestartSec=5
 Environment=DASHBOARD_TOKEN=45ec84a1ba9e0aab5f4605e923cc09ef
 Environment=ACTIVE_HOURS=off
+Environment=AI_MODELS=gh/gpt-4.1-2025-04-14,openrouter/cohere/north-mini-code:free,llm7/minimax-m2.7
 
 [Install]
 WantedBy=default.target
