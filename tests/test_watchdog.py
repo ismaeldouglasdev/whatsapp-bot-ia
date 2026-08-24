@@ -75,3 +75,16 @@ def test_precheck_false_aborta(monkeypatch):
     monkeypatch.setattr(bot.subprocess, "run", fake_run)
     asyncio.run(bot._watchdog_restart())
     assert not any(c and len(c) > 1 and c[1] == "restart" for c in chamadas)
+
+
+def test_boot_backoff_exponencial_cap_30():
+    seq = []
+    atual = bot._POLL_BACKOFF_START_S
+    for _ in range(6):
+        atual = bot._next_poll_interval(atual, fetched=False)
+        seq.append(atual)
+    assert seq == [4.0, 8.0, 16.0, 30.0, 30.0, 30.0]
+
+
+def test_sucesso_volta_ritmo_normal():
+    assert bot._next_poll_interval(16.0, fetched=True) == 30.0

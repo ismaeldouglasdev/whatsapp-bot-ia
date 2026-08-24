@@ -1748,12 +1748,26 @@ async def _watchdog_restart():
         pass
 
 
+# --- Backoff do poller (race de boot: Evolution sobe depois do bot) ---
+POLL_INTERVAL_S = int(os.environ.get("POLL_INTERVAL_S", "30"))
+_POLL_BACKOFF_START_S = 2
+
+
+def _next_poll_interval(current: float, fetched: bool) -> float:
+    """Backoff exponencial 2..30s enquanto o fetch falha; sucesso volta ao ritmo normal."""
+    if fetched:
+        return float(POLL_INTERVAL_S)
+    return min(float(POLL_INTERVAL_S), max(float(_POLL_BACKOFF_START_S), current * 2))
+
+
 async def _poll_instance_state(app: web.Application):
     """Polla periodicamente o estado da instancia; watchdog age se prega."""
     global _conn_bad_streak, _post_restart_polls, _watchdog_suspended_until
     session = app["http"]
+    poll_s = float(_POLL_BACKOFF_START_S)
     while True:
         state = None
+        fetched = False
         try:
             async with session.get(
                 f"{EVOLUTION_URL}/instance/connectionState/{INSTANCE}",
@@ -1761,6 +1775,7 @@ async def _poll_instance_state(app: web.Application):
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status == 200:
+                    fetched = True
                     data = await resp.json(content_type=None)
                     payload = data.get("instance", data) if isinstance(data, dict) else {}
                     state = payload.get("state") if isinstance(payload, dict) else None
@@ -1768,6 +1783,8 @@ async def _poll_instance_state(app: web.Application):
                     log.warning("[PANEL] fetch instance state HTTP %s", resp.status)
         except Exception as exc:  # noqa: BLE001
             log.warning("[PANEL] erro ao fetch estado: %s", exc)
+
+        poll_s = _next_poll_interval(poll_s, fetched)
 
         if state == "open":
             _conn_bad_streak = 0
@@ -1785,7 +1802,7 @@ async def _poll_instance_state(app: web.Application):
                 await _watchdog_restart()
                 _conn_bad_streak = 0
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(poll_s)
 
 
 # ---------------------------------------------------------------------------
