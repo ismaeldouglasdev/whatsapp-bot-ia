@@ -11,10 +11,10 @@ RestartSec=5
 Environment=DASHBOARD_TOKEN=45ec84a1ba9e0aab5f4605e923cc09ef
 Environment=ACTIVE_HOURS=off
 Environment=AI_MODELS=combo-round-robin,gh/gpt-4.1-2025-04-14
-Environment=DAILY_SEND_CAP=120
-Environment=HOURLY_SEND_CAP=20
-Environment=PER_CHAT_HOURLY_CAP=15
-Environment=NEW_CONTACT_DAILY_CAP=10
+Environment=DAILY_SEND_CAP=200
+Environment=HOURLY_SEND_CAP=30
+Environment=PER_CHAT_HOURLY_CAP=25
+Environment=NEW_CONTACT_DAILY_CAP=40
 Environment=MIN_REPLY_GAP_S=10
 
 [Install]
