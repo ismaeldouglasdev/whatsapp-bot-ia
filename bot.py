@@ -120,6 +120,7 @@ STICKER_MODE = os.environ.get("STICKER_MODE", "crop")  # crop | full
 STICKER_MAX_VIDEO_S = int(os.environ.get("STICKER_MAX_VIDEO_S", "8"))
 FFMPEG = os.environ.get("FFMPEG_PATH", "ffmpeg")
 _video_sticker_ok = True  # desativada em runtime se ffmpeg ausente (check no startup)
+REACTIONS = os.environ.get("REACTIONS", "true").lower() == "true"
 
 log = logging.getLogger("wabot")
 
@@ -1052,6 +1053,34 @@ async def send_sticker(
 # ---------------------------------------------------------------------------
 # Comandos (. ou !) — respostas determinísticas sem inferência
 # ---------------------------------------------------------------------------
+async def _send_reaction(
+    session: aiohttp.ClientSession, remote_jid: str, msg_id: str | None, emoji: str
+) -> None:
+    """Reacao fire-and-forget via /message/sendReaction; falha so loga DEBUG.
+
+    Nota: v2.3.7 nao expoe endpoint REST de read-receipts (sondado: 404) —
+    por isso nao ha marcacao de lida nesta versao.
+    """
+    if not msg_id:
+        return
+    url = f"{EVOLUTION_URL}/message/sendReaction/{INSTANCE}"
+    payload = {
+        "key": {"remoteJid": remote_jid, "fromMe": False, "id": msg_id},
+        "reaction": emoji,
+    }
+    try:
+        async with session.post(
+            url, json=payload,
+            headers={"apikey": EVOLUTION_API_KEY},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status not in (200, 201):
+                raise RuntimeError(f"HTTP {resp.status}")
+        log.debug("[REACTION] %s %s", msg_id, emoji)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("[REACTION] falhou (%s)", exc)
+
+
 _CMD_RE = re.compile(r"^[.!](\w+)\s*(.*)$", re.DOTALL)
 _games_velha: dict[str, dict] = {}
 _games_forca: dict[str, dict] = {}
@@ -1382,7 +1411,9 @@ COMMANDS: dict[str, CommandHandler] = {
 }
 
 
-async def dispatch_command(request: web.Request, remote_jid: str, text: str) -> bool:
+async def dispatch_command(
+    request: web.Request, remote_jid: str, text: str, key: dict | None = None
+) -> bool:
     """Executa comando se a mensagem casar; True = consumida."""
     m = _CMD_RE.match(text.strip())
     if not m:
@@ -1395,6 +1426,10 @@ async def dispatch_command(request: web.Request, remote_jid: str, text: str) -> 
     try:
         await fn(request, remote_jid, args)
         _register_send(remote_jid)
+        if REACTIONS and key:
+            await _send_reaction(
+                request.app["http"], remote_jid, key.get("id"), "\u2705"
+            )
         log.info("→ comando .%s executado | enviados hoje: %d/%d", cmd, _state["sent_today"], DAILY_SEND_CAP)
     except Exception as exc:  # noqa: BLE001
         log.error("[cmd .%s] %s", cmd, exc)
@@ -1537,7 +1572,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
     log.info("[%s] %s", push_name, text[:120])
 
     # --- Comandos (. ou !) — resposta instantânea, sem IA ---------------------
-    if text[:1] in (".", "!") and await dispatch_command(request, remote_jid, text):
+    if text[:1] in (".", "!") and await dispatch_command(request, remote_jid, text, key=key):
         return web.json_response({"ok": True, "action": "command"})
 
     # --- IA + resposta -------------------------------------------------------
