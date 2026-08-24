@@ -8,7 +8,7 @@ WorkingDirectory=/home/ismaeldev/Desktop/code_study/MeusProjetos/whatsapp-bot
 ExecStart=/usr/bin/python3 /home/ismaeldev/Desktop/code_study/MeusProjetos/whatsapp-bot/bot.py
 Restart=on-failure
 RestartSec=5
-Environment=DASHBOARD_TOKEN=45ec84a1ba9e0aab5f4605e923cc09ef
+EnvironmentFile=%h/.config/wabot/env.local
 Environment=ACTIVE_HOURS=off
 Environment=AI_MODELS=combo-round-robin,gh/gpt-4.1-2025-04-14
 Environment=DAILY_SEND_CAP=200

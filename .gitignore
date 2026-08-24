@@ -12,3 +12,4 @@ __pycache__/
 # Lembretes locais
 📅_*
 state.json
+env.local
