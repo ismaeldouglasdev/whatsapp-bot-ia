@@ -779,6 +779,15 @@ def _mentions_own_jid(data: dict, own_jid: str | None) -> bool:
 # Dedup + histórico
 # ---------------------------------------------------------------------------
 _HISTORY_TTL_S = 7 * 86400
+_jid_alt: dict[str, str] = {}
+
+
+def _send_number(remote_jid: str) -> str:
+    """Preferencia pelo numero real (remoteJidAlt) quando o chat ve como @lid."""
+    alt = _jid_alt.get(remote_jid)
+    base = alt or remote_jid
+    return base.split("@")[0]
+
 
 
 def _hist_get(jid: str) -> list[dict]:
@@ -1162,7 +1171,7 @@ MENU_TEXT = (
     "▸ .traduz <texto> — tradução automática\n"
     "▸ .lembrar HH:MM <texto> — lembrete agendado\n"
     "▸ .piada — uma risada rápida\n"
-    "▸ .info — status do bot\n"
+    "\u25b8 No grupo: comandos funcionam soltos \u2014 e m\u00eddia com legenda .s vira figurinha\n"    "▸ .info — status do bot\n"
     "▸ .dolar / .euro / .moedas — cotações\n"
     "▸ .clima <cidade> — tempo agora\n"
     "▸ .figtexto <texto> — figurinha de texto\n"
@@ -1454,11 +1463,16 @@ async def _cmd_quiz(request: web.Request, jid: str, args: str) -> None:
 
 CommandHandler = Callable[[web.Request, str, str], Awaitable[None]]
 
+async def _cmd_s(request: web.Request, jid: str, args: str) -> None:
+    """Alias: manda a imagem/video com legenda .s no grupo que vira figurinha."""
+    await _try_send(request, jid, "Manda a imagem ou vídeo com legenda .s que eu converto 🎬")
+
+
 async def _cmd_reset(request: web.Request, jid: str, args: str) -> None:
     """Limpa o contexto desta conversa."""
     _state.get("history", {}).pop(jid, None)
     await send_whatsapp(
-        request.app["http"], jid.split("@")[0], "🧹 Contexto desta conversa limpo!",
+        request.app["http"], _send_number(jid), "🧹 Contexto desta conversa limpo!",
         humanize_delay_ms("🧹"),
     )
 
@@ -1621,6 +1635,7 @@ COMMANDS: dict[str, CommandHandler] = {
     "figtexto": _cmd_figtexto,
     "quiz": _cmd_quiz,
     "reset": _cmd_reset,
+    "s": _cmd_s,
     "resumo": _cmd_resumo,
     "traduz": _cmd_traduz,
     "lembrar": _cmd_lembrar,
@@ -1686,6 +1701,11 @@ async def handle_webhook(request: web.Request) -> web.Response:
     has_img = is_image_message(data.get("message"))
     has_video = is_video_message(data.get("message"))
     quoted_sticker = extract_quoted_sticker_b64(data.get("message"))
+    alt = key.get("remoteJidAlt")
+    if isinstance(alt, str) and "@" in alt:
+        if len(_jid_alt) > 200:
+            _jid_alt.pop(next(iter(_jid_alt)))
+        _jid_alt[remote_jid] = alt
     push_name = data.get("pushName") or remote_jid.split("@")[0]
     _contact(remote_jid)["total_in"] += 1
     # Sonda de menção usa o texto ORIGINAL (o strip abaixo some com o @digits)
@@ -1700,7 +1720,8 @@ async def handle_webhook(request: web.Request) -> web.Response:
             log.info("[grupo desativado] %s", push_name)
             return web.json_response({"ok": True, "skipped": "group"})
         own = await get_own_jid(request.app["http"])
-        if not (_mentions_own_jid(data, own) or (mention_probe and _MENTION_TEXT_RE.search(mention_probe))):
+        comando_solto = bool(text) and text[0] in ".!"
+        if not comando_solto and not (_mentions_own_jid(data, own) or (mention_probe and _MENTION_TEXT_RE.search(mention_probe))):
             log.info("[grupo sem menção] %s: %r", push_name, (text or "")[:60])
             return web.json_response({"ok": True, "skipped": "group-no-mention"})
 
@@ -1768,7 +1789,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
         try:
             await send_sticker(
                 request.app["http"],
-                remote_jid.split("@")[0],
+                _send_number(remote_jid),
                 sticker_b64,
                 humanize_delay_ms("figurinha"),
             )
@@ -1836,7 +1857,7 @@ async def _try_send(request: web.Request, remote_jid: str, text: str) -> bool:
     try:
         await send_whatsapp(
             request.app["http"],
-            remote_jid.split("@")[0],
+            _send_number(remote_jid),
             text,
             humanize_delay_ms(text),
         )
