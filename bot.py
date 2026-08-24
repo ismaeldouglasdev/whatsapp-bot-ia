@@ -463,6 +463,15 @@ def _load_state() -> None:
         _state["sent_today"] = 0
     _state.setdefault("blacklist", [])
     _state.setdefault("contacts", {})
+    _state.setdefault("history", {})
+    cutoff = time.time() - _HISTORY_TTL_S
+    for jid in list(_state["history"]):
+        vivos = [m for m in _state["history"][jid] if isinstance(m, dict) and m.get("ts", 0) >= cutoff]
+        if vivos:
+            _state["history"][jid] = vivos[-HISTORY_TURNS:]
+        else:
+            del _state["history"][jid]
+    _state.setdefault("reminders", [])
 
 
 def _save_state() -> None:
@@ -737,7 +746,18 @@ def _mentions_own_jid(data: dict, own_jid: str | None) -> bool:
 # ---------------------------------------------------------------------------
 # Dedup + histórico
 # ---------------------------------------------------------------------------
-_history: dict[str, deque] = defaultdict(lambda: deque(maxlen=HISTORY_TURNS))
+_HISTORY_TTL_S = 7 * 86400
+
+
+def _hist_get(jid: str) -> list[dict]:
+    return _state["history"].setdefault(jid, [])
+
+
+def _hist_append(jid: str, role: str, content: str) -> None:
+    """Persiste a troca no state (cap HISTORY_TURNS)."""
+    h = _state["history"].setdefault(jid, [])
+    h.append({"role": role, "content": content, "ts": time.time()})
+    del h[:-HISTORY_TURNS]
 _seen_ids: dict[str, float] = {}
 _SEEN_MAX = 500
 
@@ -825,7 +845,12 @@ async def ask_ai(
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if use_history:
-        messages += list(_history[chat_jid])
+        cutoff = time.time() - _HISTORY_TTL_S
+        messages += [
+            {"role": m["role"], "content": m["content"]}
+            for m in _hist_get(chat_jid)
+            if m.get("ts", 0) >= cutoff
+        ]
     messages.append({"role": "user", "content": user_text})
 
     last_error = None
@@ -1101,7 +1126,7 @@ _WMO = {
 
 MENU_TEXT = (
     "🤖 *Comandos do bot*\n"
-    "▸ .ping — teste rápido\n"
+    "▸ .ping — teste rápido\n"    "▸ .reset — limpa o contexto da conversa\n"
     "▸ .info — status do bot\n"
     "▸ .dolar / .euro / .moedas — cotações\n"
     "▸ .clima <cidade> — tempo agora\n"
@@ -1170,7 +1195,7 @@ async def _cmd_info(request: web.Request, jid: str, args: str) -> None:
         f"ℹ️ instância `{INSTANCE}`\n"
         f"🧠 rota: {chain}\n"
         f"📤 hoje: {_state['sent_today']}/{DAILY_SEND_CAP} (cap {HOURLY_SEND_CAP}/h)\n"
-        f"💬 chats ativos: {len(_history)}",
+        f"💬 chats ativos: {len(_state['history'])}",
     )
 
 
@@ -1394,6 +1419,15 @@ async def _cmd_quiz(request: web.Request, jid: str, args: str) -> None:
 
 CommandHandler = Callable[[web.Request, str, str], Awaitable[None]]
 
+async def _cmd_reset(request: web.Request, jid: str, args: str) -> None:
+    """Limpa o contexto desta conversa."""
+    _state.get("history", {}).pop(jid, None)
+    await send_whatsapp(
+        request.app["http"], jid.split("@")[0], "🧹 Contexto desta conversa limpo!",
+        humanize_delay_ms("🧹"),
+    )
+
+
 COMMANDS: dict[str, CommandHandler] = {
     "menu": _cmd_menu,
     "start": _cmd_menu,
@@ -1408,6 +1442,7 @@ COMMANDS: dict[str, CommandHandler] = {
     "forca": _cmd_forca,
     "figtexto": _cmd_figtexto,
     "quiz": _cmd_quiz,
+    "reset": _cmd_reset,
 }
 
 
@@ -1596,8 +1631,9 @@ async def handle_webhook(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(exc)}, status=502)
 
     answer = sanitize_reply(answer)
-    _history[remote_jid].append({"role": "user", "content": text})
-    _history[remote_jid].append({"role": "assistant", "content": answer})
+    _hist_append(remote_jid, "user", text)
+    _hist_append(remote_jid, "assistant", answer)
+    _save_state()
 
     ok = await _try_send(request, remote_jid, answer)
     if ok:
@@ -1633,7 +1669,7 @@ async def handle_health(request: web.Request) -> web.Response:
             "enviados_hoje": _state["sent_today"],
             "cap_diario": DAILY_SEND_CAP,
             "blacklist": len(_state["blacklist"]),
-            "chats_ativos": len(_history),
+            "chats_ativos": len(_state["history"]),
         }
     )
 
@@ -1703,7 +1739,7 @@ async def handle_api_state(request: web.Request) -> web.Response:
             "instance_state": _panel_state["instance"],
             "sent_today": _state["sent_today"],
             "hourly_global_count": len(_global_hour),
-            "chats_ativos": len(_history),
+            "chats_ativos": len(_state["history"]),
             "caps": {"daily": DAILY_SEND_CAP, "hourly": HOURLY_SEND_CAP},
             "ia": {
                 "chain": [m.strip() for m in AI_MODELS.split(",") if m.strip()],
