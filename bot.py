@@ -77,6 +77,7 @@ CONTACT_MATURITY_DAYS = float(os.environ.get("CONTACT_MATURITY_DAYS", "3"))
 OPT_OUT_RE = re.compile(r"^\s*/?(sair|parar|stop|descadastrar|remover)\s*$", re.I)
 OPT_IN_RE = re.compile(r"^\s*/?(voltar|start|optin)\s*$", re.I)
 LINK_RE = re.compile(r"https?://\S+|www\.\S+", re.I)
+_MENTION_TEXT_RE = re.compile(r"@\d{6,}")
 
 # --- Figurinhas -------------------------------------------------------------
 STICKER_ENABLED = os.environ.get("STICKER_ENABLED", "true").lower() == "true"
@@ -671,7 +672,7 @@ async def get_own_jid(session: aiohttp.ClientSession) -> str | None:
             data = await resp.json(content_type=None)
             items = data if isinstance(data, list) else [data]
             for item in items:
-                if isinstance(item, dict) and item.get("instanceName") == INSTANCE:
+                if isinstance(item, dict) and INSTANCE in (item.get("instanceName"), item.get("name")):
                     _own_jid = item.get("ownerJid") or None
                     break
     except Exception as exc:  # noqa: BLE001
@@ -1376,7 +1377,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
             log.info("[grupo desativado] %s", push_name)
             return web.json_response({"ok": True, "skipped": "group"})
         own = await get_own_jid(request.app["http"])
-        if not _mentions_own_jid(data, own):
+        if not (_mentions_own_jid(data, own) or (text and _MENTION_TEXT_RE.search(text))):
             log.info("[grupo sem menção] %s: %r", push_name, (text or "")[:60])
             return web.json_response({"ok": True, "skipped": "group-no-mention"})
 
