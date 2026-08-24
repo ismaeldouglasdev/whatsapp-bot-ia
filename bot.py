@@ -20,6 +20,7 @@ import logging
 import os
 import random
 import re
+import subprocess
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
@@ -1598,10 +1599,82 @@ async def handle_api_state(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------
 # Tarefas em segundo plano (estado da instância e logs)
 # ---------------------------------------------------------------------------
+# --- Watchdog de conexao (auto-restart capado da instancia presa) ---
+WATCHDOG_BAD_POLLS = int(os.environ.get("WATCHDOG_BAD_POLLS", "3"))
+WATCHDOG_AUTORESTART = os.environ.get("WATCHDOG_AUTORESTART", "true").lower() == "true"
+WATCHDOG_MIN_GAP_S = int(os.environ.get("WATCHDOG_MIN_GAP_S", "300"))
+WATCHDOG_MAX_RESTARTS = int(os.environ.get("WATCHDOG_MAX_RESTARTS", "3"))
+_conn_bad_streak = 0
+_watchdog_restarts: deque = deque()
+_watchdog_suspended_until = 0.0
+_post_restart_polls = 0
+
+
+def _watchdog_should_fire(now: float) -> bool:
+    """Decisao pura de disparo do auto-restart (testavel)."""
+    if not WATCHDOG_AUTORESTART:
+        return False
+    if _conn_bad_streak < WATCHDOG_BAD_POLLS:
+        return False
+    if now < _watchdog_suspended_until:
+        return False
+    if _watchdog_restarts and now - _watchdog_restarts[-1] < WATCHDOG_MIN_GAP_S:
+        return False
+    if sum(1 for ts in _watchdog_restarts if ts > now - 3600) >= WATCHDOG_MAX_RESTARTS:
+        return False
+    return True
+
+
+def _watchdog_precheck_container() -> bool:
+    """True somente se o container existe e esta Up."""
+    try:
+        out = subprocess.run(
+            ["docker", "ps", "--filter", "name=evolution_api", "--format", "{{.Status}}"],
+            timeout=10, capture_output=True, text=True,
+        )
+        return "Up" in (out.stdout or "")
+    except Exception as exc:  # noqa: BLE001
+        log.error("[WATCHDOG] pre-check falhou: %s", exc)
+        return False
+
+
+async def _watchdog_restart():
+    """Reinicia o container com pre/post-check; nunca logout/QR."""
+    global _post_restart_polls
+    if not _watchdog_precheck_container():
+        log.error("[WATCHDOG] container evolution_api nao esta Up — abortando episodio")
+        return
+    _watchdog_restarts.append(time.time())
+    log.warning(
+        "[WATCHDOG] instancia %s ha %d polls — restart #%d",
+        INSTANCE, _conn_bad_streak, len(_watchdog_restarts),
+    )
+    try:
+        await asyncio.to_thread(
+            subprocess.run, ["docker", "restart", "evolution_api"],
+            timeout=60, capture_output=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.error("[WATCHDOG] restart falhou: %s", exc)
+        _watchdog_suspended_until = time.time() + 1800
+        return
+    _post_restart_polls = 3
+    try:
+        subprocess.run(
+            ["notify-send", "-a", "caelestia", "[WATCHDOG] Bot WhatsApp",
+             "Instancia caiu - reiniciando container"],
+            timeout=5, capture_output=True,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _poll_instance_state(app: web.Application):
-    """Polla periodicamente o estado da instância e guarda em _panel_state."""
+    """Polla periodicamente o estado da instancia; watchdog age se prega."""
+    global _conn_bad_streak, _post_restart_polls, _watchdog_suspended_until
     session = app["http"]
     while True:
+        state = None
         try:
             async with session.get(
                 f"{EVOLUTION_URL}/instance/connectionState/{INSTANCE}",
@@ -1612,13 +1685,27 @@ async def _poll_instance_state(app: web.Application):
                     data = await resp.json(content_type=None)
                     payload = data.get("instance", data) if isinstance(data, dict) else {}
                     state = payload.get("state") if isinstance(payload, dict) else None
-                    _panel_state["instance"] = str(state) if state else "unknown"
                 else:
                     log.warning("[PANEL] fetch instance state HTTP %s", resp.status)
-                    _panel_state["instance"] = "unknown"
         except Exception as exc:  # noqa: BLE001
             log.warning("[PANEL] erro ao fetch estado: %s", exc)
-            _panel_state["instance"] = "unknown"
+
+        if state == "open":
+            _conn_bad_streak = 0
+            _post_restart_polls = 0
+            _panel_state["instance"] = str(state)
+        else:
+            _conn_bad_streak += 1
+            _panel_state["instance"] = str(state) if state else "unknown"
+            if _post_restart_polls > 0:
+                _post_restart_polls -= 1
+                if _post_restart_polls == 0:
+                    log.critical("[WATCHDOG] pos-restart sem open em 3 polls — suspenso 30min")
+                    _watchdog_suspended_until = time.time() + 1800
+            elif _watchdog_should_fire(time.time()):
+                await _watchdog_restart()
+                _conn_bad_streak = 0
+
         await asyncio.sleep(30)
 
 
