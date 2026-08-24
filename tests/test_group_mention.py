@@ -80,3 +80,20 @@ def test_send_number_prefere_alt_lid():
 
 def test_alias_s_registrado():
     assert "s" in bot.COMMANDS
+
+
+def test_sticker_exif_canonico():
+    """REGRESSAO metadata: VP8X->EXIF->VP8 e decodificavel com o pack."""
+    import base64, io
+    from PIL import Image
+    img = Image.new("RGBA", (300, 500), (10, 200, 90, 255))
+    b = io.BytesIO(); img.save(b, "PNG")
+    raw = bot.make_sticker_raw(base64.b64encode(b.getvalue()).decode())
+    pos, chunks = 12, []
+    while pos + 8 <= len(raw):
+        f = raw[pos:pos+4].decode(errors="replace")
+        s = int.from_bytes(raw[pos+4:pos+8], "little")
+        chunks.append(f); pos += 8 + s + (s % 2)
+    assert chunks[0] == "VP8X" and "EXIF" in chunks
+    assert chunks.index("EXIF") == 1 or chunks[0] == "VP8X"
+    assert b"ismaeldev" in raw

@@ -1062,7 +1062,10 @@ def make_sticker_raw(media_b64: str) -> bytes:
         canvas.paste(img, ((STICKER_SIZE - img.width) // 2, (STICKER_SIZE - img.height) // 2))
 
     out = io.BytesIO()
-    canvas.save(out, "WEBP", quality=90, method=4)
+    canvas.save(
+        out, "WEBP", quality=90, method=4,
+        exif=_sticker_exif(STICKER_PACK_NAME, STICKER_AUTHOR),
+    )
     return _mux_exif_after_vp8x(out.getvalue(), _sticker_exif(STICKER_PACK_NAME, STICKER_AUTHOR))
 
 
@@ -1418,7 +1421,10 @@ def _make_text_sticker_raw(text: str) -> bytes:
         draw.text(((STICKER_SIZE - w_box) / 2, y), ln, font=font, fill=(240, 240, 240, 255))
         y += line_h
     out = io.BytesIO()
-    canvas.save(out, "WEBP", quality=90, method=4)
+    canvas.save(
+        out, "WEBP", quality=90, method=4,
+        exif=_sticker_exif(STICKER_PACK_NAME, STICKER_AUTHOR),
+    )
     return _mux_exif_after_vp8x(out.getvalue(), _sticker_exif(STICKER_PACK_NAME, STICKER_AUTHOR))
 
 
