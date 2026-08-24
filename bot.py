@@ -456,8 +456,26 @@ def _load_state() -> None:
         try:
             _state.update(json.loads(STATE_FILE.read_text()))
         except Exception as exc:  # noqa: BLE001
-            log.error("state.json corrompido (%s) — começando limpo", exc)
+            log.error("state.json corrompido (%s) — tentando backups", exc)
+            recuperado = False
+            for bak in sorted(STATE_FILE.parent.glob("state.json.bak-*"),
+                              key=lambda p: int(p.name.rsplit("-", 1)[-1]), reverse=True):
+                try:
+                    _state.update(json.loads(bak.read_text()))
+                    log.info("[BACKUP] estado recuperado de %s", bak.name)
+                    recuperado = True
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+            if not recuperado:
+                log.error("sem backup válido — começando limpo")
     today = datetime.now().strftime("%Y-%m-%d")
+    day_changed = _state.get("date") != today and _state.get("date") is not None and STATE_FILE.exists()
+    if day_changed:
+        try:
+            _rotate_state_backup()
+        except Exception as exc:  # noqa: BLE001
+            log.error("[BACKUP] rotacao falhou: %s", exc)
     if _state.get("date") != today:  # reset diário
         _state["date"] = today
         _state["sent_today"] = 0
@@ -472,6 +490,20 @@ def _load_state() -> None:
         else:
             del _state["history"][jid]
     _state.setdefault("reminders", [])
+
+
+def _rotate_state_backup() -> None:
+    """Gira state.json.bak-1..7 uma vez por dia (chamado na virada do dia)."""
+    if not STATE_FILE.exists():
+        return
+    baks = sorted(
+        STATE_FILE.parent.glob("state.json.bak-*"),
+        key=lambda p: int(p.name.rsplit("-", 1)[-1]),
+    )
+    n = (int(baks[-1].name.rsplit("-", 1)[-1]) if baks else 0) % 7 + 1
+    STATE_FILE.replace(STATE_FILE.parent / f"state.json.n-{n}") if False else shutil.copy2(
+        STATE_FILE, STATE_FILE.parent / f"state.json.bak-{n}"
+    )
 
 
 def _save_state() -> None:
