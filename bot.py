@@ -703,17 +703,20 @@ def extract_quoted_sticker_b64(message: dict | None) -> str | None:
 
 async def download_media(session: aiohttp.ClientSession, data: dict) -> str | None:
     """Baixa mídia via API quando o webhook não trouxe base64."""
+    key = (data.get("key") or {}) if isinstance(data, dict) else {}
+    msg = _unwrap_message(data.get("message") or {})
+    payload = {"message": {"key": key, "message": msg}}
     try:
         async with session.post(
-            f"{EVOLUTION_URL}/message/downloadMedia/{INSTANCE}",
-            json={"message": data},
+            f"{EVOLUTION_URL}/chat/getBase64FromMediaMessage/{INSTANCE}",
+            json=payload,
             headers={"apikey": EVOLUTION_API_KEY},
-            timeout=aiohttp.ClientTimeout(total=60),
+            timeout=aiohttp.ClientTimeout(total=90),
         ) as resp:
             body = await resp.json(content_type=None)
             if resp.status == 200:
                 return body.get("base64") or None
-            log.error("downloadMedia HTTP %s: %s", resp.status, str(body)[:200])
+            log.error("getBase64FromMediaMessage HTTP %s: %s", resp.status, str(body)[:200])
     except Exception as exc:  # noqa: BLE001
         log.error("downloadMedia erro: %s", exc)
     return None
