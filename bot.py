@@ -611,6 +611,28 @@ def _in_active_hours() -> bool:
 # ---------------------------------------------------------------------------
 # Extração de texto do payload Evolution v2
 # ---------------------------------------------------------------------------
+_WRAPPERS = ("viewOnceMessageV2", "viewOnceMessage", "ephemeralMessage",
+             "documentWithCaptionMessage")
+
+
+def _unwrap_message(message):
+    """Desembrulha viewOnce/ephemeral/etc (ate 3 niveis)."""
+    d = message
+    for _ in range(3):
+        if not isinstance(d, dict):
+            break
+        achou = False
+        for w in _WRAPPERS:
+            nodo = d.get(w)
+            if isinstance(nodo, dict):
+                d = nodo.get("message") if isinstance(nodo.get("message"), dict) else nodo
+                achou = True
+                break
+        if not achou:
+            break
+    return d
+
+
 _TEXT_KEYS = (
     ("conversation",),
     ("extendedTextMessage", "text"),
@@ -622,6 +644,7 @@ _TEXT_KEYS = (
 
 
 def extract_text(message: dict | None) -> str | None:
+    message = _unwrap_message(message)
     if not isinstance(message, dict):
         return None
     for path in _TEXT_KEYS:
@@ -652,10 +675,12 @@ def extract_image_b64(message: dict | None) -> str | None:
 
 
 def is_image_message(message: dict | None) -> bool:
+    message = _unwrap_message(message)
     return isinstance(message, dict) and isinstance(message.get("imageMessage"), dict)
 
 
 def is_video_message(message: dict | None) -> bool:
+    message = _unwrap_message(message)
     return isinstance(message, dict) and isinstance(message.get("videoMessage"), dict)
 
 
@@ -759,7 +784,7 @@ async def get_own_jid(session: aiohttp.ClientSession) -> str | None:
 
 def _mentions_own_jid(data: dict, own_jid: str | None) -> bool:
     """Verifica menções em qualquer contextInfo (texto, legenda de mídia etc.)."""
-    msg = data.get("message") or {}
+    msg = _unwrap_message(data.get("message") or {})
     mentioned: list[str] = []
     for key in ("extendedTextMessage", "imageMessage", "videoMessage", "documentMessage"):
         node = msg.get(key)
@@ -1492,7 +1517,7 @@ def _quoted_text(data: dict | None) -> str | None:
     """Texto de mensagem citada (contextInfo.quotedMessage)."""
     if not isinstance(data, dict):
         return None
-    msg = data.get("message") or {}
+    msg = _unwrap_message(data.get("message") or {})
     ctx = None
     for k in ("extendedTextMessage", "imageMessage", "videoMessage", "documentMessage"):
         node = msg.get(k)
@@ -1728,7 +1753,8 @@ async def handle_webhook(request: web.Request) -> web.Response:
         own = await get_own_jid(request.app["http"])
         comando_solto = bool(text) and text[0] in ".!"
         if not comando_solto and not (_mentions_own_jid(data, own) or (mention_probe and _MENTION_TEXT_RE.search(mention_probe))):
-            log.info("[grupo sem menção] %s: %r", push_name, (text or "")[:60])
+            msg_keys = list((data.get("message") or {}).keys())
+            log.info("[grupo sem menção] %s: %r | msg_keys=%s", push_name, (text or "")[:60], msg_keys)
             return web.json_response({"ok": True, "skipped": "group-no-mention"})
 
     if not text and not has_img and not has_video and not quoted_sticker:
