@@ -39,7 +39,10 @@ INSTANCE = os.environ.get("EVOLUTION_INSTANCE", "bot_ia")
 
 AI_URL = os.environ.get("AI_URL", "http://localhost:20131/v1/chat/completions")
 AI_MODEL = os.environ.get("AI_MODEL", "9router/ollama/gpt-oss:120b")
+AI_MODELS = os.environ.get("AI_MODELS", "9router/ollama/gpt-oss:120b,9router/nvidia/minimaxai/minimax-m3,groq/llama-3.3-70b-versatile")
+AI_ATTEMPT_TIMEOUT_S = int(os.environ.get("AI_ATTEMPT_TIMEOUT_S", "40"))
 AI_TIMEOUT_S = int(os.environ.get("AI_TIMEOUT_S", "90"))
+DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
 
 BOT_PORT = int(os.environ.get("BOT_PORT", "8084"))
 HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "12"))
@@ -86,6 +89,327 @@ log = logging.getLogger("wabot")
 # Estado persistente (contadores diários, blacklist, contatos)
 # ---------------------------------------------------------------------------
 _state: dict = {"date": "", "sent_today": 0, "blacklist": [], "contacts": {}}
+
+# ---------------------------------------------------------------------------
+# IA e envio de falhas globais (stats e backoff)
+# ---------------------------------------------------------------------------
+_ia_stats: dict[str, dict] = {}
+_ia_last_model: str | None = None
+_send_fails: dict[str, int] = {}
+_chat_backoff_until: dict[str, float] = {}
+_panel_state: dict[str, str] = {"instance": "unknown"}
+
+# ---------------------------------------------------------------------------
+# Logs ao vivo (RingLog) para o dashboard
+# ---------------------------------------------------------------------------
+from collections import deque
+class RingLog(logging.Handler):
+    def __init__(self, maxlen: int = 250):
+        super().__init__()
+        self.buffer = deque(maxlen=maxlen)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        level = record.levelname.upper()
+        msg = self.format(record)
+        self.buffer.append({"ts": ts, "level": level, "msg": msg})
+
+    def get_recent(self, count: int | None = None) -> list[dict]:
+        if count is None or count > len(self.buffer):
+            return list(self.buffer)
+        return list(self.buffer)[-count:]
+
+_ring_log = RingLog(maxlen=250)
+_ring_log.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S"))
+
+# ---------------------------------------------------------------------------
+# Painel web HTML e helpers de estado da instância
+# ---------------------------------------------------------------------------
+_DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🤖 Painel do Bot WhatsApp</title>
+    <style>
+        :root {
+            --bg: #0f172a;
+            --bg-secondary: #1e293b;
+            --text: #f1f5f9;
+            --text-muted: #94a3b8;
+            --primary: #3b82f6;
+            --warning: #f59e0b;
+            --error: #ef4444;
+            --success: #10b981;
+            --border: #334155;
+            --card: #1e293b;
+            --log-bg: #0f172a;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            padding: 20px;
+            line-height: 1.5;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: var(--card);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+        }
+        .header h1 { font-size: 2rem; display: flex; align-items: center; gap: 10px; }
+        .status-dot {
+            width: 12px; height: 12px; border-radius: 50%;
+            display: inline-block; margin-right: 8px;
+        }
+        .status-open { background: var(--success); }
+        .status-close { background: var(--error); }
+        .status-unknown { background: var(--warning); }
+        .refresh-btn {
+            background: var(--primary); color: white; border: none;
+            padding: 10px 20px; border-radius: 8px; cursor: pointer;
+            font-size: 14px; transition: background 0.2s;
+        }
+        .refresh-btn:hover { background: #2563eb; }
+        .grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px; margin-bottom: 30px;
+        }
+        .card {
+            background: var(--card); padding: 20px; border-radius: 12px;
+            border: 1px solid var(--border); transition: transform 0.2s;
+        }
+        .card:hover { transform: translateY(-2px); }
+        .card h3 { margin-bottom: 15px; color: var(--primary); font-size: 1.2rem; }
+        .card.status .status-indicators { display: flex; gap: 10px; margin-top: 10px; }
+        .status-indicator {
+            flex: 1; padding: 10px; border-radius: 8px; text-align: center;
+            background: var(--bg-secondary); border: 1px solid var(--border);
+        }
+        .status-indicator.open { border-color: var(--success); color: var(--success); }
+        .status-indicator.close { border-color: var(--error); color: var(--error); }
+        .status-indicator.unknown { border-color: var(--warning); color: var(--warning); }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid var(--border); }
+        th { background: var(--bg-secondary); position: sticky; top: 0; }
+        .badge {
+            display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px;
+            font-weight: 600; margin-right: 5px;
+        }
+        .badge.warning { background: var(--warning); color: #000; }
+        .badge.error { background: var(--error); color: white; }
+        .badge.success { background: var(--success); color: white; }
+        .badge.primary { background: var(--primary); color: white; }
+        .logs-container {
+            background: var(--log-bg); border: 1px solid var(--border);
+            border-radius: 8px; padding: 15px; font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 13px; max-height: 500px; overflow-y: auto;
+        }
+        .log-entry {
+            display: flex; padding: 6px 0; border-bottom: 1px solid var(--border);
+            align-items: center;
+        }
+        .log-entry:last-child { border-bottom: none; }
+        .log-timestamp { color: var(--text-muted); min-width: 70px; }
+        .log-level { min-width: 70px; font-weight: 600; }
+        .log-msg { flex: 1; }
+        .empty { color: var(--text-muted); text-align: center; padding: 40px; }
+        @media (max-width: 768px) {
+            .grid { grid-template-columns: 1fr; }
+            .header { flex-direction: column; gap: 15px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1><span class="status-dot status-open"></span>🤖 Painel do Bot WhatsApp</h1>
+            <button class="refresh-btn" onclick="location.reload()">🔄 Atualizar Agora</button>
+        </div>
+
+        <div class="grid">
+            <div class="card status">
+                <h3>📊 Status da Instância</h3>
+                <div class="status-indicators">
+                    <div class="status-indicator open">
+                        <div>🟢 Aberto</div>
+                        <div id="inst-state">Carregando...</div>
+                    </div>
+                    <div class="status-indicator close">
+                        <div>🔴 Fechado</div>
+                        <div id="inst-state-close">-</div>
+                    </div>
+                    <div class="status-indicator unknown">
+                        <div>❓ Desconhecido</div>
+                        <div id="inst-state-unknown">-</div>
+                    </div>
+                </div>
+                <table style="margin-top: 15px;">
+                    <tr><td>Enviar hoje</td><td id="sent-today">0/25</td></tr>
+                    <tr><td>Cap global</td><td id="hourly-cap">0/6</td></tr>
+                    <tr><td>Chats ativos</td><td id="active-chats">0</td></tr>
+                    <tr><td>Blacklist</td><td id="blacklist-count">0</td></tr>
+                </table>
+            </div>
+
+            <div class="card">
+                <h3>🔗 Chain de Modelos IA</h3>
+                <div id="ia-chain">Carregando...</div>
+            </div>
+
+            <div class="card">
+                <h3>📈 Stats de Modelos IA</h3>
+                <div id="ia-stats-table">Carregando...</div>
+            </div>
+
+            <div class="card">
+                <h3>👥 Contatos Recentes</h3>
+                <div id="contacts-table">Carregando...</div>
+            </div>
+
+            <div class="card">
+                <h3>⛔ Blacklist</h3>
+                <div id="blacklist-chips">Carregando...</div>
+            </div>
+
+            <div class="card">
+                <h3>⏱️ Backoffs de Envio</h3>
+                <div id="backoffs-table">Carregando...</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>📜 Logs ao Vivo (últimos ~60)</h3>
+            <div class="logs-container" id="logs-container">Carregando...</div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchState() {
+            const url = '/api/state';
+            const token = new URLSearchParams(window.location.search).get('token');
+            const headers = {};
+            if (token) {
+                headers['Authorization'] = 'Bearer ' + token;
+            }
+            try {
+                const resp = await fetch(url, { headers });
+                if (resp.status === 401 || resp.status === 403) {
+                    alert('Acesso negado ao painel');
+                    return;
+                }
+                const data = await resp.json();
+                updateUI(data);
+            } catch (e) {
+                console.error('Erro ao buscar estado:', e);
+            }
+        }
+
+        function updateUI(data) {
+            // Status da instância
+            const inst = data.instance_state || 'unknown';
+            document.getElementById('inst-state').textContent = inst === 'open' ? 'Aberto' : inst;
+            document.getElementById('inst-state-close').textContent = inst === 'close' ? 'Fechado' : '-';
+            document.getElementById('inst-state-unknown').textContent = inst === 'unknown' ? 'Desconhecido' : '-';
+
+            // Enviados hoje e caps
+            document.getElementById('sent-today').textContent = `${data.sent_today || 0}/${data.caps?.daily || 0}`;
+            document.getElementById('hourly-cap').textContent = `${data.hourly_global_count || 0}/${data.caps?.hourly || 0}`;
+            document.getElementById('active-chats').textContent = data.chats_ativos || 0;
+            document.getElementById('blacklist-count').textContent = data.blacklist?.length || 0;
+
+            // Chain de IA
+            if (data.ia?.chain?.length) {
+                document.getElementById('ia-chain').innerHTML =
+                    data.ia.chain.map(m => `<span class="badge primary">${m}</span>`).join(' ');
+            } else {
+                document.getElementById('ia-chain').innerHTML = 'Carregando...';
+            }
+
+            // Tabela de stats de IA
+            if (data.ia?.models) {
+                let html = '<table><tr><th>Modelo</th><th>OK</th><th>Fail</th><th>Último erro</th><th>Última ms</th></tr>';
+                for (const [model, stats] of Object.entries(data.ia.models)) {
+                    html += `<tr>`;
+                    html += `<td>${model}</td>`;
+                    html += `<td>${stats.ok}</td>`;
+                    html += `<td>${stats.fail}</td>`;
+                    html += `<td>${stats.last_error ? stats.last_error.substring(0, 80) : '-'}</td>`;
+                    html += `<td>${stats.last_ms ? stats.last_ms + 'ms' : '-'}</td>`;
+                    html += `</tr>`;
+                }
+                html += '</table>';
+                document.getElementById('ia-stats-table').innerHTML = html;
+            }
+
+            // Tabela de contatos
+            if (data.contacts?.length) {
+                let html = '<table><tr><th>JID</th><th>Primeiro visto</th><th>Entrada</th><th>Saída</th></tr>';
+                for (const c of data.contacts) {
+                    html += `<tr>`;
+                    html += `<td>${c.jid}</td>`;
+                    html += `<td>${new Date(c.first_seen_iso).toLocaleString()}</td>`;
+                    html += `<td>${c.total_in}</td>`;
+                    html += `<td>${c.total_out}</td>`;
+                    html += `</tr>`;
+                }
+                html += '</table>';
+                document.getElementById('contacts-table').innerHTML = html;
+            }
+
+            // Chips de blacklist
+            if (data.blacklist?.length) {
+                let html = '';
+                for (const jid of data.blacklist) {
+                    html += `<span class="badge error">${jid}</span>`;
+                }
+                document.getElementById('blacklist-chips').innerHTML = html;
+            }
+
+            // Tabela de backoffs
+            if (data.backoffs && Object.keys(data.backoffs).length) {
+                let html = '<table><tr><th>JID</th><th>Tempo restante</th></tr>';
+                for (const [jid, remaining] of Object.entries(data.backoffs)) {
+                    html += `<tr>`;
+                    html += `<td>${jid}</td>`;
+                    html += `<td>${Math.round(remaining)}s</td>`;
+                    html += `</tr>`;
+                }
+                html += '</table>';
+                document.getElementById('backoffs-table').innerHTML = html;
+            }
+
+            // Logs
+            if (data.logs?.length) {
+                let html = '';
+                for (const log of data.logs) {
+                    const levelClass = log.level === 'WARNING' ? 'warning' :
+                                       log.level === 'ERROR' ? 'error' : 'success';
+                    html += `<div class="log-entry">`;
+                    html += `<span class="log-timestamp">${log.ts}</span>`;
+                    html += `<span class="log-level ${levelClass}">${log.level}</span>`;
+                    html += `<span class="log-msg">${log.msg}</span>`;
+                    html += `</div>`;
+                }
+                document.getElementById('logs-container').innerHTML = html;
+            }
+        }
+
+        // Atualização automática a cada 3 segundos
+        setInterval(fetchState, 3000);
+        fetchState();
+    </script>
+</body>
+</html>
+"""
 
 
 def _load_state() -> None:
@@ -392,29 +716,79 @@ def _seen_once(msg_id: str) -> bool:
     return True
 
 
+async def _extract_ai_content(status_code: int, body_text: str) -> str:
+    """Extrai conteúdo de respostas JSON ou SSE: raise se vazio/erro."""
+    if status_code != 200:
+        raise RuntimeError(f"IA HTTP {status_code}: {body_text[:200]}")
+    try:
+        body = json.loads(body_text)
+        choices = body.get("choices", [])
+        if not choices:
+            raise ValueError("IA sem escolhas válidas")
+        return choices[0]["message"].get("content", "").strip()
+    except json.JSONDecodeError:
+        pass  # corpo não é JSON, tentar SSE...
+
+    content = ""  # Acumula SSE por linhas
+    for line in body_text.splitlines():
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        try:
+            chunk = json.loads(line.removeprefix("data: ").strip())
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            content += delta.get("content", "")
+        except Exception:
+            continue
+    if not content.strip():
+        raise RuntimeError(f"IA respondeu em branco ou inválido: {body_text[:200]}")
+    return content
+
+
 async def ask_ai(session: aiohttp.ClientSession, chat_jid: str, user_text: str) -> str:
+    """Executa query com fallback chain e stats globais por modelo."""
+    models = [m.strip() for m in AI_MODELS.split(",") if m.strip()]
+
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages += list(_history[chat_jid])
     messages.append({"role": "user", "content": user_text})
 
-    payload = {
-        "model": AI_MODEL,
-        "messages": messages,
-        "stream": False,
-        "max_tokens": 1024,
-        "temperature": 0.7,
-    }
-    async with session.post(
-        AI_URL, json=payload, timeout=aiohttp.ClientTimeout(total=AI_TIMEOUT_S)
-    ) as resp:
-        body = await resp.json(content_type=None)
-        if resp.status != 200:
-            raise RuntimeError(f"IA HTTP {resp.status}: {str(body)[:200]}")
-        content = (body["choices"][0]["message"] or {}).get("content") or ""
-        content = content.strip()
-        if not content:
-            raise RuntimeError(f"IA respondeu vazio: {str(body)[:200]}")
-        return content
+    last_error = None
+    for model in models:
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "max_tokens": 1024,
+            "temperature": 0.7,
+        }
+
+        try:
+            start = time.time()
+            async with session.post(
+                AI_URL, json=payload,
+                timeout=aiohttp.ClientTimeout(total=AI_ATTEMPT_TIMEOUT_S),
+            ) as resp:
+                body = await resp.text()
+                content = await _extract_ai_content(resp.status, body)
+                duration = int((time.time() - start) * 1000)
+
+                # Stats globais do modelo ao responder
+                _ia_stats.setdefault(model, {"ok": 0, "fail": 0, "last_error": None, "last_ms": None})
+                _ia_stats[model].update(ok=_ia_stats[model]["ok"] + 1, last_error=None, last_ms=duration)
+                global _ia_last_model
+                _ia_last_model = model
+                return content
+        except Exception as exc:
+            log.warning("[IA] Modelo %s falhou inesperadamente: %s", model, exc)
+            if model not in _ia_stats:
+                _ia_stats[model] = {"ok": 0, "fail": 0, "last_error": None, "last_ms": None}
+            _ia_stats[model]["fail"] += 1
+            _ia_stats[model]["last_error"] = str(exc)
+            last_error = f"{model}={exc}"
+
+        await asyncio.sleep(1)  # Respeito mínimo entre tentativas
+
+    raise RuntimeError(f"IA falhou para {len(models)} modelos: {last_error}")
 
 
 async def send_whatsapp(
@@ -751,11 +1125,114 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
+# Painel web (dashboard + API de estado)
+# ---------------------------------------------------------------------------
+def _check_dashboard_auth(request: web.Request) -> bool:
+    """True se autorizado. Sem DASHBOARD_TOKEN configurado, acesso liberado."""
+    if not DASHBOARD_TOKEN:
+        return True
+    auth = request.headers.get("Authorization", "")
+    if auth == f"Bearer {DASHBOARD_TOKEN}":
+        return True
+    return request.query.get("token") == DASHBOARD_TOKEN
+
+
+async def handle_dashboard(request: web.Request) -> web.Response:
+    if not _check_dashboard_auth(request):
+        raise web.HTTPUnauthorized(text="Acesso negado ao painel")
+    return web.Response(text=_DASHBOARD_HTML, content_type="text/html")
+
+
+async def handle_root(request: web.Request) -> web.Response:
+    """Redireciona / para /dashboard preservando o token da query, se houver."""
+    token = request.query.get("token")
+    target = "/dashboard" + (f"?token={token}" if token else "")
+    raise web.HTTPFound(location=target)
+
+
+async def handle_api_state(request: web.Request) -> web.Response:
+    if not _check_dashboard_auth(request):
+        raise web.HTTPUnauthorized(text="Acesso negado ao painel")
+    now = time.time()
+    _prune(_global_hour, 3600)
+
+    contacts = sorted(
+        (
+            {
+                "jid": jid,
+                "first_seen_iso": datetime.fromtimestamp(c.get("first_seen", now)).isoformat(),
+                "total_in": c.get("total_in", 0),
+                "total_out": c.get("total_out", 0),
+            }
+            for jid, c in _state["contacts"].items()
+        ),
+        key=lambda c: c["first_seen_iso"],
+        reverse=True,
+    )
+    backoffs = {
+        jid: round(max(0.0, until - now), 1)
+        for jid, until in _chat_backoff_until.items()
+        if until > now
+    }
+
+    return web.json_response(
+        {
+            "instance_state": _panel_state["instance"],
+            "sent_today": _state["sent_today"],
+            "hourly_global_count": len(_global_hour),
+            "chats_ativos": len(_history),
+            "caps": {"daily": DAILY_SEND_CAP, "hourly": HOURLY_SEND_CAP},
+            "ia": {
+                "chain": [m.strip() for m in AI_MODELS.split(",") if m.strip()],
+                "models": _ia_stats,
+            },
+            "contacts": contacts,
+            "blacklist": list(_state["blacklist"]),
+            "backoffs": backoffs,
+            "logs": _ring_log.get_recent(60),
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tarefas em segundo plano (estado da instância e logs)
+# ---------------------------------------------------------------------------
+async def _poll_instance_state(app: web.Application):
+    """Polla periodicamente o estado da instância e guarda em _panel_state."""
+    session = app["http"]
+    while True:
+        try:
+            async with session.get(
+                f"{EVOLUTION_URL}/instance/connectionState/{INSTANCE}",
+                headers={"apikey": EVOLUTION_API_KEY},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    payload = data.get("instance", data) if isinstance(data, dict) else {}
+                    state = payload.get("state") if isinstance(payload, dict) else None
+                    _panel_state["instance"] = str(state) if state else "unknown"
+                else:
+                    log.warning("[PANEL] fetch instance state HTTP %s", resp.status)
+                    _panel_state["instance"] = "unknown"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[PANEL] erro ao fetch estado: %s", exc)
+            _panel_state["instance"] = "unknown"
+        await asyncio.sleep(30)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 async def http_session_ctx(app: web.Application):
     app["http"] = aiohttp.ClientSession()
+    poller = asyncio.create_task(_poll_instance_state(app))
     yield
+    poller.cancel()
+    try:
+        await poller
+    except asyncio.CancelledError:
+        pass
     await app["http"].close()
 
 
@@ -765,11 +1242,15 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+    logging.getLogger("wabot").addHandler(_ring_log)
     _load_state()
     app = web.Application()
     app.cleanup_ctx.append(http_session_ctx)
     app.router.add_post("/webhook", handle_webhook)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/", handle_root)
+    app.router.add_get("/dashboard", handle_dashboard)
+    app.router.add_get("/api/state", handle_api_state)
 
     log.info(
         "Bot subindo :%s | instância=%s modelo=%s | WARMUP=%s caps: %d/dia %d/h %d/chat/h",

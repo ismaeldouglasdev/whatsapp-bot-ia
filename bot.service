@@ -8,6 +8,7 @@ WorkingDirectory=/home/ismaeldev/Desktop/code_study/MeusProjetos/whatsapp-bot
 ExecStart=/usr/bin/python3 /home/ismaeldev/Desktop/code_study/MeusProjetos/whatsapp-bot/bot.py
 Restart=on-failure
 RestartSec=5
+Environment=DASHBOARD_TOKEN=45ec84a1ba9e0aab5f4605e923cc09ef
 
 [Install]
 WantedBy=default.target
