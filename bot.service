@@ -9,6 +9,7 @@ ExecStart=/usr/bin/python3 /home/ismaeldev/Desktop/code_study/MeusProjetos/whats
 Restart=on-failure
 RestartSec=5
 Environment=DASHBOARD_TOKEN=45ec84a1ba9e0aab5f4605e923cc09ef
+Environment=ACTIVE_HOURS=off
 
 [Install]
 WantedBy=default.target
