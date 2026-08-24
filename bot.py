@@ -78,6 +78,7 @@ class AiUpstreamError(RuntimeError):
 class AiUnavailable(RuntimeError):
     """Todos os modelos da chain falharam ou estao em cooldown."""
 DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
+WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
 
 BOT_PORT = int(os.environ.get("BOT_PORT", "8084"))
 HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "12"))
@@ -1405,6 +1406,9 @@ async def dispatch_command(request: web.Request, remote_jid: str, text: str) -> 
 # Handler do webhook
 # ---------------------------------------------------------------------------
 async def handle_webhook(request: web.Request) -> web.Response:
+    if not _webhook_authorized(request):
+        log.warning("[WEBHOOK] 403 de %s (token ausente/errado)", request.remote)
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=403)
     try:
         payload = await request.json()
     except Exception:
@@ -1602,10 +1606,19 @@ async def handle_health(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------
 # Painel web (dashboard + API de estado)
 # ---------------------------------------------------------------------------
+def _webhook_authorized(request: web.Request) -> bool:
+    """Fail-closed: sem WEBHOOK_TOKEN configurado, ninguem passa."""
+    if not WEBHOOK_TOKEN:
+        return False
+    if request.query.get("token") == WEBHOOK_TOKEN:
+        return True
+    return request.headers.get("X-Webhook-Token") == WEBHOOK_TOKEN
+
+
 def _check_dashboard_auth(request: web.Request) -> bool:
     """True se autorizado. Sem DASHBOARD_TOKEN configurado, acesso liberado."""
     if not DASHBOARD_TOKEN:
-        return True
+        return False  # fail-closed: sem token configurado, ninguem ve o painel
     auth = request.headers.get("Authorization", "")
     if auth == f"Bearer {DASHBOARD_TOKEN}":
         return True
@@ -1833,6 +1846,8 @@ def main() -> None:
             FFMPEG,
         )
         _video_sticker_ok = False
+    if not WEBHOOK_TOKEN:
+        log.critical("WEBHOOK_TOKEN vazio - /webhook rejeitara TODOS os posts (fail-closed)")
     _load_state()
     app = web.Application()
     app.cleanup_ctx.append(http_session_ctx)
