@@ -56,3 +56,15 @@ def test_strip_mencao_prefixo_comando():
     t2 = bot._MENTION_TEXT_RE.sub("", texto, count=1).strip()
     assert t2 == ".menu"
     assert bot._CMD_RE.match(t2)
+
+
+def test_gate_usa_probe_original_nao_stripped():
+    """REGRESSAO do bug de ordem: gate avalia @digits ANTES do strip apagar."""
+    texto = "@166280413880338 .menu"
+    probe = texto or ""
+    stripped = bot._MENTION_TEXT_RE.sub("", texto, count=1).strip()
+    # gate precisa passar com o probe original...
+    passa = bool(bot._MENTION_TEXT_RE.search(probe))
+    assert passa and stripped == ".menu"
+    # ...e o gate NÃO pode mais enxergar o @digits depois do strip
+    assert not bot._MENTION_TEXT_RE.search(stripped)

@@ -1688,7 +1688,8 @@ async def handle_webhook(request: web.Request) -> web.Response:
     quoted_sticker = extract_quoted_sticker_b64(data.get("message"))
     push_name = data.get("pushName") or remote_jid.split("@")[0]
     _contact(remote_jid)["total_in"] += 1
-    # Menção chega como "@<lid-digits> ." no texto — strip para o dispatcher ver o comando
+    # Sonda de menção usa o texto ORIGINAL (o strip abaixo some com o @digits)
+    mention_probe = text or ""
     if text and is_group(remote_jid):
         t2 = _MENTION_TEXT_RE.sub("", text, count=1).strip()
         if t2 != text:
@@ -1699,7 +1700,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
             log.info("[grupo desativado] %s", push_name)
             return web.json_response({"ok": True, "skipped": "group"})
         own = await get_own_jid(request.app["http"])
-        if not (_mentions_own_jid(data, own) or (text and _MENTION_TEXT_RE.search(text))):
+        if not (_mentions_own_jid(data, own) or (mention_probe and _MENTION_TEXT_RE.search(mention_probe))):
             log.info("[grupo sem menção] %s: %r", push_name, (text or "")[:60])
             return web.json_response({"ok": True, "skipped": "group-no-mention"})
 
