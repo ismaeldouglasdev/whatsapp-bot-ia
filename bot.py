@@ -20,7 +20,9 @@ import logging
 import os
 import random
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
@@ -30,7 +32,13 @@ from pathlib import Path
 
 import aiohttp
 from aiohttp import web
-from PIL import Image
+
+try:
+    from PIL import Image
+except ImportError as _pil_exc:  # pragma: no cover
+    raise SystemExit(
+        "Pillow ausente - rode: pip install -r requirements.txt"
+    ) from _pil_exc
 
 # ---------------------------------------------------------------------------
 # Configuração
@@ -110,6 +118,7 @@ STICKER_SIZE = int(os.environ.get("STICKER_SIZE", "512"))
 STICKER_MODE = os.environ.get("STICKER_MODE", "crop")  # crop | full
 STICKER_MAX_VIDEO_S = int(os.environ.get("STICKER_MAX_VIDEO_S", "8"))
 FFMPEG = os.environ.get("FFMPEG_PATH", "ffmpeg")
+_video_sticker_ok = True  # desativada em runtime se ffmpeg ausente (check no startup)
 
 log = logging.getLogger("wabot")
 
@@ -991,6 +1000,8 @@ def make_sticker_raw(media_b64: str) -> bytes:
 
 async def make_video_sticker_raw(video_b64: str) -> bytes:
     """Vídeo curto (base64 mp4) → WebP animado 512x512 com EXIF."""
+    if not _video_sticker_ok:
+        raise RuntimeError("figurinhas de vídeo desativadas: ffmpeg não encontrado")
     if video_b64.strip().startswith("data:"):
         _, _, video_b64 = video_b64.partition(",")
     vf = (
@@ -1799,6 +1810,12 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
     logging.getLogger("wabot").addHandler(_ring_log)
+    if STICKER_ENABLED and not shutil.which(FFMPEG):
+        log.error(
+            "ffmpeg não encontrado (FFMPEG_PATH=%r) - figurinhas de vídeo desativadas",
+            FFMPEG,
+        )
+        _video_sticker_ok = False
     _load_state()
     app = web.Application()
     app.cleanup_ctx.append(http_session_ctx)
