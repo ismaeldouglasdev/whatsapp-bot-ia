@@ -734,6 +734,26 @@ def extract_media_url(data: dict | None) -> str | None:
     return None
 
 
+async def download_or_embed_video(session: aiohttp.ClientSession, data: dict) -> str | None:
+    """Base64 embutido no webhook ou baixa do mediaUrl (MinIO)."""
+    msg = _unwrap_message(data.get("message") or {})
+    node = None
+    for k in ("videoMessage", "imageMessage", "documentMessage"):
+        v = msg.get(k)
+        if isinstance(v, dict):
+            node = v
+            break
+    if not node:
+        return None
+    b64 = node.get("base64")
+    if isinstance(b64, str) and b64:
+        return b64
+    mu = extract_media_url(data)
+    if mu:
+        return await fetch_media_url(session, mu)
+    return None
+
+
 async def fetch_media_url(session: aiohttp.ClientSession, url: str) -> str | None:
     """Baixa a mídia do MinIO/S3 (mediaUrl do webhook) e devolve em base64."""
     host_url = url.replace("http://minio:9000", "http://localhost:9000").replace(
@@ -826,6 +846,38 @@ def _hist_append(jid: str, role: str, content: str) -> None:
     del h[:-HISTORY_TURNS]
 _seen_ids: dict[str, float] = {}
 _SEEN_MAX = 500
+_media_cache: "dict[str, tuple[str, str]]" = {}  # msg_id -> (kind, b64)
+_MEDIA_CACHE_MAX = 25
+
+
+def _media_cache_put(msg_id: str, kind: str, b64: str) -> None:
+    if not msg_id or not b64:
+        return
+    if len(_media_cache) >= _MEDIA_CACHE_MAX:
+        _media_cache.pop(next(iter(_media_cache)))
+    _media_cache[msg_id] = (kind, b64)
+
+
+def _quoted_msg_id(data: dict | None) -> str | None:
+    """stanzaId da mensagem citada (contextInfo), se houver."""
+    msg = _unwrap_message((data or {}).get("message") or {})
+    for k in ("extendedTextMessage", "imageMessage", "videoMessage", "documentMessage",
+              "stickerMessage"):
+        node = msg.get(k)
+        if isinstance(node, dict):
+            ctx = node.get("contextInfo")
+            if isinstance(ctx, dict):
+                sid = ctx.get("stanzaId")
+                if isinstance(sid, str) and sid:
+                    return sid
+    return None
+
+
+def _media_cache_get(msg_id: str):
+    item = _media_cache.get(msg_id)
+    return item  # (kind, b64) | None
+
+
 
 
 def _seen_once(msg_id: str) -> bool:
@@ -1732,6 +1784,12 @@ async def handle_webhook(request: web.Request) -> web.Response:
     has_img = is_image_message(data.get("message"))
     has_video = is_video_message(data.get("message"))
     quoted_sticker = extract_quoted_sticker_b64(data.get("message"))
+    if has_img and media_b64:
+        _media_cache_put(msg_id, "img", media_b64)
+    elif has_video:
+        _vid_b64 = await download_or_embed_video(request.app["http"], data)
+        if _vid_b64:
+            _media_cache_put(msg_id, "video", _vid_b64)
     alt = key.get("remoteJidAlt")
     if isinstance(alt, str) and "@" in alt:
         if len(_jid_alt) > 200:
@@ -1745,6 +1803,35 @@ async def handle_webhook(request: web.Request) -> web.Response:
         t2 = _MENTION_TEXT_RE.sub("", text, count=1).strip()
         if t2 != text:
             text = t2 or None
+
+    # --- .s respondendo midia citada (funciona em grupo sem mencao) ---
+    if text and text.strip() in (".s", "s") and is_group(remote_jid):
+        qid = _quoted_msg_id(data)
+        hit = _media_cache_get(qid) if qid else None
+        if hit and request.app["http"]:
+            kind, b64 = hit
+            try:
+                sticker_raw = (
+                    await make_video_sticker_raw(b64) if kind == "video" else make_sticker_raw(b64)
+                )
+                await send_sticker(
+                    request.app["http"], _send_number(remote_jid),
+                    base64.b64encode(sticker_raw).decode(),
+                    humanize_delay_ms("figurinha"),
+                )
+                _register_send(remote_jid)
+                log.info("→ figurinha (citada via .s) enviada | enviados hoje: %d/%d",
+                         _state["sent_today"], DAILY_SEND_CAP)
+                return web.json_response({"ok": True, "action": "sticker-quoted"})
+            except Exception as exc:  # noqa: BLE001
+                log.error("[.s citada] %s", exc)
+                await _try_send(request, remote_jid, "Não consegui converter essa mídia 😅")
+                return web.json_response({"ok": False}, status=502)
+        await _try_send(
+            request, remote_jid,
+            "A mídia citada não tá mais no meu cache ⏳ manda ela de novo com legenda .s",
+        )
+        return web.json_response({"ok": True, "action": "sticker-miss"})
 
     if is_group(remote_jid):
         if not RESPOND_IN_GROUPS:
@@ -1840,7 +1927,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
     if not text:
         return web.json_response({"ok": True, "skipped": "no-text"})
 
-    log.info("[%s] %s", push_name, text[:120])
+    log.info("[%s] %s | keys=%s", push_name, text[:120], list((data.get("message") or {}).keys()))
 
     # --- Comandos (. ou !) — resposta instantânea, sem IA ---------------------
     _last_data[remote_jid] = data
