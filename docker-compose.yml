@@ -8,11 +8,11 @@ services:
     environment:
       POSTGRES_DB: evolution
       POSTGRES_USER: evolution
-      POSTGRES_PASSWORD: evolution
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5433:5433"
+      - "127.0.0.1:5433:5433"
     command: postgres -c listen_addresses='*' -p 5433
     networks:
       - evolution_net
@@ -25,7 +25,7 @@ services:
     volumes:
       - redis_data:/data
     ports:
-      - "6380:6380"
+      - "127.0.0.1:6380:6380"
     networks:
       - evolution_net
 
@@ -53,9 +53,10 @@ services:
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: evolution
-      MINIO_ROOT_PASSWORD: evolution2026
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set}
     ports:
-      - "9000:9000"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - /mnt/data/minio-data:/data
     networks:
