@@ -1371,6 +1371,11 @@ async def handle_webhook(request: web.Request) -> web.Response:
     quoted_sticker = extract_quoted_sticker_b64(data.get("message"))
     push_name = data.get("pushName") or remote_jid.split("@")[0]
     _contact(remote_jid)["total_in"] += 1
+    # Menção chega como "@<lid-digits> ." no texto — strip para o dispatcher ver o comando
+    if text and is_group(remote_jid):
+        t2 = _MENTION_TEXT_RE.sub("", text, count=1).strip()
+        if t2 != text:
+            text = t2 or None
 
     if is_group(remote_jid):
         if not RESPOND_IN_GROUPS:

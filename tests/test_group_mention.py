@@ -47,3 +47,12 @@ def test_grupo_mensagem_comum_continua_ignorada():
     data = {"message": {"conversation": texto}}
     passa = bot._mentions_own_jid(data, "5599@s.whatsapp.net") or (texto and bot._MENTION_TEXT_RE.search(texto))
     assert not passa
+
+
+def test_strip_mencao_prefixo_comando():
+    """'@166... .menu' em grupo vira '.menu' para o dispatcher."""
+    import re as _re
+    texto = "@166280413880338 .menu"
+    t2 = bot._MENTION_TEXT_RE.sub("", texto, count=1).strip()
+    assert t2 == ".menu"
+    assert bot._CMD_RE.match(t2)
