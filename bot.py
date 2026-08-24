@@ -714,7 +714,7 @@ async def download_media(session: aiohttp.ClientSession, data: dict) -> str | No
             timeout=aiohttp.ClientTimeout(total=90),
         ) as resp:
             body = await resp.json(content_type=None)
-            if resp.status == 200:
+            if resp.status in (200, 201):
                 return body.get("base64") or None
             log.error("getBase64FromMediaMessage HTTP %s: %s", resp.status, str(body)[:200])
     except Exception as exc:  # noqa: BLE001
