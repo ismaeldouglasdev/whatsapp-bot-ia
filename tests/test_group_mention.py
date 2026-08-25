@@ -78,8 +78,9 @@ def test_send_number_prefere_alt_lid():
     bot._jid_alt.clear()
 
 
-def test_alias_s_registrado():
-    assert "s" in bot.COMMANDS
+def test_alias_s_tratado_no_webhook():
+    """Design novo: .s eh interceptado no webhook (nao mais alias de COMMANDS)."""
+    assert "s" not in bot.COMMANDS
 
 
 def test_sticker_exif_canonico():
@@ -107,12 +108,17 @@ def test_find_recent_media_filtra_tipos():
          "message": {"videoMessage": {"url": "x"}}},
     ]}}
 
+    class R:
+        status = 200
+        async def json(self, **k):
+            return recs
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+
     class S:
         def post(self, *a, **k):
-            class R:
-                status = 200
-                async def json(self, **k):
-                    return recs
             return R()
 
     bot._media_seen.clear()
