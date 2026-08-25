@@ -1,0 +1,20 @@
+{
+  "schema_version": 2,
+  "active_work_id": "wabot-melhorias-20260824",
+  "works": {
+    "wabot-melhorias-20260824": {
+      "work_id": "wabot-melhorias-20260824",
+      "active_plan": ".omo/plans/wabot-proximas-melhorias.md",
+      "plan_name": "wabot-proximas-melhorias",
+      "session_ids": [
+        "opencode:wabot-exec-1787583284"
+      ],
+      "status": "completed",
+      "worktree_path": null,
+      "objective": "Executar plano wabot-proximas-melhorias até 100% dos checkboxes: 13 todos (T1-T13) em 4 waves + onda final F1-F4. Entrega direta no repo (sem PR). Verificação por pytest + QA de superfície real + adversarial ultraqa; executor≠verificador.",
+      "delivery_mode": "direct",
+      "notes": "Regra anti-conflito: edits em bot.py SERIAIS entre workers. T6/T7 paralelizam com cadeia bot.py (arquivos distintos). Caps anti-ban intocados (regression guard T12). Sem envio proativo.",
+      "completed_at": "2026-08-24T15:25:00-03:00"
+    }
+  }
+}
