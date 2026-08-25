@@ -1629,7 +1629,10 @@ async def _cmd_figtexto(request: web.Request, jid: str, args: str) -> None:
         await _try_send(request, jid, "Uso: `.figtexto seu texto aqui`")
         return
     sticker_b64 = base64.b64encode(_make_text_sticker_raw(txt)).decode()
-    await send_sticker(request.app["http"], jid.split("@")[0], sticker_b64, humanize_delay_ms("figurinha"))
+    await send_sticker(
+        request.app["http"], _send_number(jid), sticker_b64,
+        humanize_delay_ms("figurinha"), not_convert=True,
+    )
     _register_send(jid)
 
 
@@ -1941,6 +1944,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
                     session_http, _send_number(remote_jid),
                     base64.b64encode(sticker_raw).decode(),
                     humanize_delay_ms("figurinha"),
+                    not_convert=True,
                 )
                 _register_send(remote_jid)
                 log.info(
