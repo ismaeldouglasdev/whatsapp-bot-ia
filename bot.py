@@ -20,6 +20,7 @@ import logging
 import os
 import random
 import re
+import sqlite3
 import shutil
 import subprocess
 import sys
@@ -899,7 +900,13 @@ async def _find_recent_media(session: aiohttp.ClientSession, remote_jid: str):
         records = ((d or {}).get("messages") or {}).get("records") or []
         cutoff = time.time() - 600  # so midia dos ultimos 10 minutos
         for rec in records:
-            if (rec.get("key") or {}).get("fromMe"):
+            k0 = rec.get("key") or {}
+            # CRITICO: a Evolution v2.3.7 IGNORA o filtro remoteJid do findMessages
+            # (retorna mensagens de QUALQUER chat). Sem este check, midia de grupo
+            # vaza pra PV. Verificacao client-side obrigatoria.
+            if str(k0.get("remoteJid", "")) != remote_jid:
+                continue
+            if k0.get("fromMe"):
                 continue
             mt = rec.get("messageType")
             if mt in ("videoMessage", "imageMessage"):
@@ -1353,6 +1360,70 @@ _games_forca: dict[str, dict] = {}
 _quiz_state: dict[str, dict] = {}
 _quiz_recent: dict[str, list[str]] = {}
 
+QUIZ_DB_PATH = os.environ.get("QUIZ_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "quiz.db"))
+QUIZ_MIN_BANK = int(os.environ.get("QUIZ_MIN_BANK", "100"))  # serve do banco a partir de N perguntas
+
+
+def _quiz_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(QUIZ_DB_PATH)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS quiz_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pergunta TEXT UNIQUE NOT NULL,
+            alts TEXT NOT NULL,
+            correta TEXT NOT NULL,
+            tema TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        )"""
+    )
+    return conn
+
+
+def _quiz_bank_save(q: dict, tema: str) -> None:
+    """Salva pergunta gerada (ignora duplicatas via UNIQUE)."""
+    try:
+        with _quiz_db() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO quiz_questions (pergunta, alts, correta, tema) VALUES (?,?,?,?)",
+                (str(q.get("pergunta", ""))[:300],
+                 json.dumps(q.get("alternativas", {}), ensure_ascii=False),
+                 str(q.get("correta", "")).lower(), tema),
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.error("[QUIZ-DB] save falhou: %s", exc)
+
+
+def _quiz_bank_count() -> int:
+    try:
+        with _quiz_db() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM quiz_questions").fetchone()[0])
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _quiz_bank_pick(jid: str) -> dict | None:
+    """Pergunta aleatória do banco evitando as últimas mostradas neste chat."""
+    try:
+        recentes = tuple(_quiz_recent.get(jid, [])[-25:])
+        with _quiz_db() as conn:
+            if recentes:
+                placeholders = ",".join("?" * len(recentes))
+                row = conn.execute(
+                    f"SELECT pergunta, alts, correta FROM quiz_questions "
+                    f"WHERE pergunta NOT IN ({placeholders}) ORDER BY RANDOM() LIMIT 1",
+                    recentes,
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT pergunta, alts, correta FROM quiz_questions ORDER BY RANDOM() LIMIT 1"
+                ).fetchone()
+        if not row:
+            return None
+        return {"pergunta": row[0], "alternativas": json.loads(row[1]), "correta": row[2]}
+    except Exception as exc:  # noqa: BLE001
+        log.error("[QUIZ-DB] pick falhou: %s", exc)
+        return None
+
 QUIZ_TEMAS = [
     "história mundial", "curiosidades de animais", "espaço e astronomia",
     "filmes e séries", "música", "esportes", "geografia", "ciência geral",
@@ -1362,9 +1433,8 @@ QUIZ_TEMAS = [
 ]
 
 
-def _quiz_prompt(jid: str) -> str:
-    """Prompt com tema aleatório + anti-repetição das últimas perguntas do chat."""
-    tema = random.choice(QUIZ_TEMAS)
+def _quiz_prompt(jid: str, tema: str) -> str:
+    """Prompt com tema sorteado + anti-repetição das últimas perguntas do chat."""
     recentes = _quiz_recent.get(jid, [])[-6:]
     evitar = (
         " NÃO repita nem fique parecido com estas perguntas já feitas neste chat: "
@@ -1682,13 +1752,26 @@ async def _cmd_quiz(request: web.Request, jid: str, args: str) -> None:
         verdict = "✅ Acertou!" if ans == correct else f"❌ Era a letra *{correct}*"
         await _try_send(request, jid, f"{verdict}\n`.quiz` pra próxima")
         return
+    # Banco maduro (>= QUIZ_MIN_BANK): serve direto, zero IA.
+    if _quiz_bank_count() >= QUIZ_MIN_BANK:
+        q = _quiz_bank_pick(jid)
+        if q:
+            alts = q["alternativas"]
+            _quiz_recent.setdefault(jid, []).append(str(q.get("pergunta", ""))[:120])
+            lines = [f"❓ {q['pergunta']}"] + [f"{k}) {v}" for k, v in sorted(alts.items())]
+            lines.append("\nResponda: `.quiz <a-d>`")
+            await _try_send(request, jid, "\n".join(lines))
+            return
+
     await _try_send(request, jid, "🎲 Gerando pergunta...")
-    raw = await ask_ai(request.app["http"], jid, _quiz_prompt(jid), use_history=False)
+    tema = random.choice(QUIZ_TEMAS)
+    raw = await ask_ai(request.app["http"], jid, _quiz_prompt(jid, tema), use_history=False)
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
         raise RuntimeError(f"quiz sem JSON: {raw[:150]}")
     q = json.loads(match.group(0))
     alts = q["alternativas"]
+    _quiz_bank_save(q, tema)
     _quiz_recent.setdefault(jid, []).append(str(q.get("pergunta", ""))[:120])
     _quiz_state[jid] = {"correta": str(q["correta"]).lower(), "ts": time.time()}
     lines = [f"❓ {q['pergunta']}"] + [f"{k}) {v}" for k, v in sorted(alts.items())]
@@ -2035,10 +2118,12 @@ async def handle_webhook(request: web.Request) -> web.Response:
         log.info("[fora do horário %s] %s", ACTIVE_HOURS, push_name)
         return web.json_response({"ok": True, "skipped": "inactive-hours"})
 
-    reason = _rate_block_reason(remote_jid)
-    if reason:
-        log.warning("[RATE LIMIT: %s] mensagem de %s ignorada", reason, push_name)
-        return web.json_response({"ok": True, "skipped": f"rate:{reason}"})
+    # Comandos explicitos (.foo / !foo) nunca caem no rate-limit — so respostas de IA.
+    if not (text[:1] in (".", "!")):
+        reason = _rate_block_reason(remote_jid)
+        if reason:
+            log.warning("[RATE LIMIT: %s] mensagem de %s ignorada", reason, push_name)
+            return web.json_response({"ok": True, "skipped": f"rate:{reason}"})
 
     # --- Figurinha (mídia recebida ou figurinha citada) ----------------------
     if (has_img or has_video or quoted_sticker) and STICKER_ENABLED:
@@ -2349,41 +2434,13 @@ def _next_poll_interval(current: float, fetched: bool) -> float:
     return min(float(POLL_INTERVAL_S), max(float(_POLL_BACKOFF_START_S), current * 2))
 
 
-async def _list_recent_chats(session: aiohttp.ClientSession) -> list[tuple[str, bool, float]]:
-    """[(remoteJid, is_group, updatedAt_ts)] de todos os chats via /chat/findChats."""
-    try:
-        async with session.post(
-            f"{EVOLUTION_URL}/chat/findChats/{INSTANCE}",
-            json={}, headers={"apikey": EVOLUTION_API_KEY},
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as resp:
-            if resp.status != 200:
-                return []
-            d = await resp.json(content_type=None)
-        out = []
-        for c in d or []:
-            if not isinstance(c, dict) or not c.get("remoteJid"):
-                continue
-            jid = c["remoteJid"]
-            upd = 0.0
-            try:
-                upd = datetime.fromisoformat(
-                    str(c.get("updatedAt", "")).replace("Z", "+00:00")
-                ).timestamp()
-            except Exception:  # noqa: BLE001
-                pass
-            out.append((jid, "@g.us" in jid, upd))
-        return out
-    except Exception as exc:  # noqa: BLE001
-        log.error("[MPOLL] findChats falhou: %s", exc)
-        return []
-
 
 async def _media_poller(app: web.Application):
     """Recupera midias que a Evolution falhou em emitir via webhook.
 
-    - Chats privados: midia nova vira figurinha automatica (proposito do bot).
-    - Grupos: so com intencao .s recente (evita spam e vazamento entre chats).
+    REGRA: figurinha SO com comando explicito — exige intencao .s recente
+    (5 min) em TODOS os chats, grupos e PVs. Fluxo no PV com webhook de
+    midia quebrado: manda a midia e depois ".s" como mensagem separada.
     - Nunca processa fromMe; caps anti-ban seguem valendo.
     """
     session = app["http"]
@@ -2391,21 +2448,15 @@ async def _media_poller(app: web.Application):
     while True:
         try:
             agora = time.time()
-            alvos_grupo = [j for j, t in list(_sticker_intent.items()) if agora - t < 300]
+            alvos = [j for j, t in list(_sticker_intent.items()) if agora - t < 300]
             for j in [_j for _j in list(_sticker_intent) if agora - _sticker_intent[_j] >= 300]:
                 _sticker_intent.pop(j, None)
 
-            if _panel_state.get("instance") != "open":
+            if _panel_state.get("instance") != "open" or not alvos:
                 await asyncio.sleep(10)
                 continue
 
-            for jid, is_group, updated in await _list_recent_chats(session):
-                # chat sem atividade recente: nada a fazer
-                if updated and agora - updated > 600:
-                    continue
-                # grupos exigem intencao .s explicita
-                if is_group and jid not in alvos_grupo:
-                    continue
+            for jid in alvos:
                 recent = await _find_recent_media(session, jid)
                 if not recent:
                     continue
