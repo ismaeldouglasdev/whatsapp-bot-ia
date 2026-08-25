@@ -105,8 +105,11 @@ def test_sticker_exif_canonico():
 def test_find_recent_media_filtra_tipos():
     """_find_recent_media pula nao-midia e ja-vistos, retorna o primeiro util."""
     recs = {"messages": {"records": [
-        {"key": {"id": "A"}, "messageType": "conversation", "message": {}},
-        {"key": {"id": "B"}, "messageType": "videoMessage",
+        {"key": {"id": "A", "remoteJid": "g@g.us"}, "messageType": "conversation", "message": {}},
+        # registro de OUTRO chat: deve ser IGNORADO mesmo sendo midia (fix vazamento)
+        {"key": {"id": "X", "remoteJid": "outro@s.whatsapp.net"}, "messageType": "videoMessage",
+         "message": {"videoMessage": {"url": "z"}}},
+        {"key": {"id": "B", "remoteJid": "g@g.us"}, "messageType": "videoMessage",
          "message": {"videoMessage": {"url": "x"}}},
     ]}}
 
