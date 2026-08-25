@@ -77,6 +77,10 @@ class AiUpstreamError(RuntimeError):
 
 class AiUnavailable(RuntimeError):
     """Todos os modelos da chain falharam ou estao em cooldown."""
+
+
+class AiTransientDisconnect(AiUpstreamError):
+    """Servidor fechou a conexao antes da resposta (transitorio de pool)."""
 DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
 
@@ -1024,6 +1028,8 @@ async def ask_ai(
     messages.append({"role": "user", "content": user_text})
 
     last_error = None
+    start_retry = time.time()
+
     for model in models:
         payload = {
             "model": model,
@@ -1062,24 +1068,65 @@ async def ask_ai(
                 return content
         except Exception as exc:
             status = getattr(exc, "status", None)
-            if status == 429:
-                cd = _AI_COOLDOWN_429_S
-            elif status in (402, 500, 502, 503):
-                cd = _AI_COOLDOWN_SERVER_S
-            elif status is None:
-                cd = _AI_COOLDOWN_TIMEOUT_S
+            msg_l = str(exc).lower()
+            transitorio = (
+                status is None
+                and ("server disconnected" in msg_l or "connection reset" in msg_l)
+            )
+            if not transitorio:
+                if status == 429:
+                    cd = _AI_COOLDOWN_429_S
+                elif status in (402, 500, 502, 503):
+                    cd = _AI_COOLDOWN_SERVER_S
+                elif status is None:
+                    cd = _AI_COOLDOWN_TIMEOUT_S
+                else:
+                    cd = _AI_COOLDOWN_OTHER_S
+                _model_cooldown[model] = time.time() + cd
             else:
-                cd = _AI_COOLDOWN_OTHER_S
-            _model_cooldown[model] = time.time() + cd
+                _model_cooldown[model] = time.time() + 15
             log.warning(
                 "[IA] Modelo %s falhou (HTTP %s) - cooldown %ds: %s",
-                model, status, cd, str(exc)[:120],
+                model, status,
+                15 if transitorio else cd,
+                str(exc)[:120],
             )
             if model not in _ia_stats:
                 _ia_stats[model] = {"ok": 0, "fail": 0, "last_error": None, "last_ms": None}
             _ia_stats[model]["fail"] += 1
             _ia_stats[model]["last_error"] = str(exc)
             last_error = f"{model}={exc}"
+
+        # Retry imediato (ate 2x) para desconexoes transitorias de pool
+        if transitorio:
+            for _retry in range(2):
+                log.info("[IA] %s: retry imediato %d/2 apos disconnect", model, _retry + 1)
+                await asyncio.sleep(0.4 * (_retry + 1))
+                try:
+                    async with session.post(
+                        AI_URL, json=payload,
+                        timeout=aiohttp.ClientTimeout(
+                            total=AI_STREAM_TOTAL_S, sock_read=AI_STREAM_IDLE_S
+                        ),
+                    ) as resp:
+                        if resp.status != 200:
+                            body = await resp.text()
+                            break  # erro HTTP real: segue chain
+                        ctype = resp.headers.get("Content-Type", "")
+                        if "event-stream" in ctype:
+                            content = await _consume_sse_stream(resp)
+                        else:
+                            body = await resp.text()
+                            content = await _extract_ai_content(resp.status, body)
+                    duration = int((time.time() - start_retry) * 1000)
+                    _ia_stats.setdefault(model, {"ok": 0, "fail": 0, "last_error": None, "last_ms": None})
+                    _ia_stats[model].update(ok=_ia_stats[model]["ok"] + 1, last_error=None, last_ms=duration)
+                    _ia_last_model = model
+                    _model_cooldown.pop(model, None)
+                    return content
+                except Exception as exc2:  # noqa: BLE001
+                    last_error = f"{model}={exc2}"
+                    continue
 
         await asyncio.sleep(1)  # Respeito mínimo entre tentativas
 
