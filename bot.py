@@ -1231,11 +1231,18 @@ async def make_video_sticker_raw(video_b64: str) -> bytes:
 
 
 async def send_sticker(
-    session: aiohttp.ClientSession, number: str, sticker_b64: str, delay_ms: int
+    session: aiohttp.ClientSession,
+    number: str,
+    sticker_b64: str,
+    delay_ms: int,
+    *,
+    media_url: str | None = None,
 ) -> None:
+    """Envia figurinha; media_url (terminando em .webp) preserva animacao."""
     url = f"{EVOLUTION_URL}/message/sendSticker/{INSTANCE}"
     headers = {"apikey": EVOLUTION_API_KEY}
-    payload = {"number": number, "sticker": sticker_b64, "delay": delay_ms}
+    sticker_field = media_url if media_url else sticker_b64
+    payload = {"number": number, "sticker": sticker_field, "delay": delay_ms}
     async with session.post(
         url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=60)
     ) as resp:
@@ -1950,8 +1957,18 @@ async def handle_webhook(request: web.Request) -> web.Response:
             await _try_send(request, remote_jid, "Não consegui baixar essa mídia 😅")
             return web.json_response({"ok": False, "error": "no-media"}, status=502)
         try:
+            media_url_for_send = None
             if has_video and not quoted_sticker:
                 sticker_raw = await make_video_sticker_raw(media_b64)
+                try:
+                    _MEDIA_SERVE_DIR.mkdir(parents=True, exist_ok=True)
+                    fname = f"st-{int(time.time()*1000)}.webp"
+                    (_MEDIA_SERVE_DIR / fname).write_bytes(sticker_raw)
+                    media_url_for_send = (
+                        f"http://172.17.0.1:{BOT_PORT}/media/{fname}?t={WEBHOOK_TOKEN}"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("[STICKER] servico de URL falhou: %s", exc)
             else:
                 sticker_raw = make_sticker_raw(media_b64)
             sticker_b64 = base64.b64encode(sticker_raw).decode()
@@ -1966,6 +1983,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
                 _send_number(remote_jid),
                 sticker_b64,
                 humanize_delay_ms("figurinha"),
+                media_url=media_url_for_send,
             )
             sent = True
         except Exception as exc:  # noqa: BLE001
@@ -2066,6 +2084,22 @@ def _webhook_authorized(request: web.Request) -> bool:
     if request.query.get("token") == WEBHOOK_TOKEN:
         return True
     return request.headers.get("X-Webhook-Token") == WEBHOOK_TOKEN
+
+
+_MEDIA_SERVE_DIR = Path(tempfile.gettempdir()) / "wabot-media"
+
+
+async def handle_serve_media(request: web.Request) -> web.FileResponse:
+    """Serve WebP animado para a Evolution baixar (isAnimated precisa de URL *.webp)."""
+    if request.query.get("t") != WEBHOOK_TOKEN or not WEBHOOK_TOKEN:
+        raise web.HTTPForbidden(text="forbidden")
+    fname = request.match_info.get("fname", "")
+    if "/" in fname or ".." in fname or not fname.endswith(".webp"):
+        raise web.HTTPNotFound()
+    path = _MEDIA_SERVE_DIR / fname
+    if not path.exists():
+        raise web.HTTPNotFound()
+    return web.FileResponse(path)
 
 
 def _check_dashboard_auth(request: web.Request) -> bool:
@@ -2275,11 +2309,23 @@ async def _media_poller(app: web.Application):
                                     if kind == "video"
                                     else make_sticker_raw(b64)
                                 )
-                                await send_sticker(
-                                    session, _send_number(jid),
-                                    base64.b64encode(sticker_raw).decode(),
-                                    humanize_delay_ms("figurinha"),
-                                )
+                                _MEDIA_SERVE_DIR.mkdir(parents=True, exist_ok=True)
+                                fname_p = f"st-{mid[:12]}.webp"
+                                (_MEDIA_SERVE_DIR / fname_p).write_bytes(sticker_raw)
+                                m_url = f"http://172.17.0.1:{BOT_PORT}/media/{fname_p}?t={WEBHOOK_TOKEN}"
+                                try:
+                                    await send_sticker(
+                                        session, _send_number(jid),
+                                        base64.b64encode(sticker_raw).decode(),
+                                        humanize_delay_ms("figurinha"),
+                                        media_url=m_url,
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    await send_sticker(
+                                        session, _send_number(jid),
+                                        base64.b64encode(sticker_raw).decode(),
+                                        humanize_delay_ms("figurinha"),
+                                    )
                                 _register_send(jid)
                                 log.info("[MPOLL] -> figurinha enviada (%s)", kind)
                             except Exception as exc:  # noqa: BLE001
@@ -2375,6 +2421,7 @@ def main() -> None:
     app = web.Application()
     app.cleanup_ctx.append(http_session_ctx)
     app.router.add_post("/webhook", handle_webhook)
+    app.router.add_get("/media/{fname}", handle_serve_media)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/", handle_root)
     app.router.add_get("/dashboard", handle_dashboard)
