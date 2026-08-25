@@ -97,3 +97,26 @@ def test_sticker_exif_canonico():
     assert chunks[0] == "VP8X" and "EXIF" in chunks
     assert chunks.index("EXIF") == 1 or chunks[0] == "VP8X"
     assert b"ismaeldev" in raw
+
+
+def test_find_recent_media_filtra_tipos():
+    """_find_recent_media pula nao-midia e ja-vistos, retorna o primeiro util."""
+    recs = {"messages": {"records": [
+        {"key": {"id": "A"}, "messageType": "conversation", "message": {}},
+        {"key": {"id": "B"}, "messageType": "videoMessage",
+         "message": {"videoMessage": {"url": "x"}}},
+    ]}}
+
+    class S:
+        def post(self, *a, **k):
+            class R:
+                status = 200
+                async def json(self, **k):
+                    return recs
+            return R()
+
+    bot._media_seen.clear()
+    got = asyncio.run(bot._find_recent_media(S(), "g@g.us"))
+    assert got and got[0] == "B" and got[1] == "video"
+    # segunda chamada: id B ja visto -> None
+    assert asyncio.run(bot._find_recent_media(S(), "g@g.us")) is None

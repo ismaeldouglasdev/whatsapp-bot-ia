@@ -861,6 +861,48 @@ def _media_cache_put(msg_id: str, kind: str, b64: str) -> None:
     _media_cache[msg_id] = (kind, b64)
 
 
+_media_seen: set[str] = set()
+
+
+def _media_seen_once(mid: str | None) -> bool:
+    """True se nao processado ainda."""
+    if not mid:
+        return False
+    if mid in _media_seen:
+        return False
+    if len(_media_seen) > 400:
+        _media_seen.clear()
+    _media_seen.add(mid)
+    return True
+
+
+async def _find_recent_media(session: aiohttp.ClientSession, remote_jid: str):
+    """Ultima imagem/video do chat via /chat/findMessages (imune a falha de emissao)."""
+    url = f"{EVOLUTION_URL}/chat/findMessages/{INSTANCE}"
+    try:
+        async with session.post(
+            url, json={"remoteJid": remote_jid, "page": 1, "offset": 15},
+            headers={"apikey": EVOLUTION_API_KEY},
+            timeout=aiohttp.ClientTimeout(total=25),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            d = await resp.json(content_type=None)
+        records = ((d or {}).get("messages") or {}).get("records") or []
+        for rec in records:
+            mt = rec.get("messageType")
+            if mt in ("videoMessage", "imageMessage"):
+                k = rec.get("key") or {}
+                mid = k.get("id")
+                if mid and _media_seen_once(mid):
+                    return (mid, "video" if mt == "videoMessage" else "img",
+                            k, rec.get("message") or {})
+        return None
+    except Exception as exc:  # noqa: BLE001
+        log.error("[.s] findMessages falhou: %s", exc)
+        return None
+
+
 def _quoted_msg_id(data: dict | None) -> str | None:
     """stanzaId da mensagem citada (contextInfo), se houver."""
     msg = _unwrap_message((data or {}).get("message") or {})
@@ -1549,11 +1591,6 @@ async def _cmd_quiz(request: web.Request, jid: str, args: str) -> None:
 
 CommandHandler = Callable[[web.Request, str, str], Awaitable[None]]
 
-async def _cmd_s(request: web.Request, jid: str, args: str) -> None:
-    """Alias: manda a imagem/video com legenda .s no grupo que vira figurinha."""
-    await _try_send(request, jid, "Manda a imagem ou vídeo com legenda .s que eu converto 🎬")
-
-
 async def _cmd_reset(request: web.Request, jid: str, args: str) -> None:
     """Limpa o contexto desta conversa."""
     _state.get("history", {}).pop(jid, None)
@@ -1721,7 +1758,6 @@ COMMANDS: dict[str, CommandHandler] = {
     "figtexto": _cmd_figtexto,
     "quiz": _cmd_quiz,
     "reset": _cmd_reset,
-    "s": _cmd_s,
     "resumo": _cmd_resumo,
     "traduz": _cmd_traduz,
     "lembrar": _cmd_lembrar,
@@ -1807,32 +1843,43 @@ async def handle_webhook(request: web.Request) -> web.Response:
         if t2 != text:
             text = t2 or None
 
-    # --- .s respondendo midia citada (funciona em grupo sem mencao) ---
-    if text and text.strip() in (".s", "s") and is_group(remote_jid):
+    # --- .s: converte a ultima midia do chat (ou a citada via cache) ---
+    if text and text.strip() in (".s", "s"):
+        session_http = request.app["http"]
+        alvo = None
         qid = _quoted_msg_id(data)
-        hit = _media_cache_get(qid) if qid else None
-        if hit and request.app["http"]:
-            kind, b64 = hit
+        cached = _media_cache_get(qid) if qid else None
+        if cached and _media_seen_once(qid):
+            alvo = (cached[0], cached[1], qid)
+        if not alvo:
+            recent = await _find_recent_media(session_http, remote_jid)
+            if recent:
+                mid, kind, k_r, m_r = recent
+                b64 = await download_media(session_http, {"key": k_r, "message": m_r})
+                if b64:
+                    alvo = (kind, b64, mid)
+        if alvo:
+            kind, b64, _mid = alvo
             try:
                 sticker_raw = (
                     await make_video_sticker_raw(b64) if kind == "video" else make_sticker_raw(b64)
                 )
                 await send_sticker(
-                    request.app["http"], _send_number(remote_jid),
+                    session_http, _send_number(remote_jid),
                     base64.b64encode(sticker_raw).decode(),
                     humanize_delay_ms("figurinha"),
                 )
                 _register_send(remote_jid)
-                log.info("→ figurinha (citada via .s) enviada | enviados hoje: %d/%d",
+                log.info("→ figurinha (.s) enviada | hoje %d/%d",
                          _state["sent_today"], DAILY_SEND_CAP)
-                return web.json_response({"ok": True, "action": "sticker-quoted"})
+                return web.json_response({"ok": True, "action": "sticker-s"})
             except Exception as exc:  # noqa: BLE001
-                log.error("[.s citada] %s", exc)
+                log.error("[.s] conversao falhou: %s", exc)
                 await _try_send(request, remote_jid, "Não consegui converter essa mídia 😅")
                 return web.json_response({"ok": False}, status=502)
         await _try_send(
             request, remote_jid,
-            "A mídia citada não tá mais no meu cache ⏳ manda ela de novo com legenda .s",
+            "Não achei mídia recente nesse chat 📎 manda a imagem/vídeo e manda .s em seguida",
         )
         return web.json_response({"ok": True, "action": "sticker-miss"})
 
