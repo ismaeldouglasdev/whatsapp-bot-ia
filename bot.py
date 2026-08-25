@@ -1351,6 +1351,34 @@ _CMD_RE = re.compile(r"^[.!](\w+)\s*(.*)$", re.DOTALL)
 _games_velha: dict[str, dict] = {}
 _games_forca: dict[str, dict] = {}
 _quiz_state: dict[str, dict] = {}
+_quiz_recent: dict[str, list[str]] = {}
+
+QUIZ_TEMAS = [
+    "história mundial", "curiosidades de animais", "espaço e astronomia",
+    "filmes e séries", "música", "esportes", "geografia", "ciência geral",
+    "tecnologia e internet", "mitologia", "comida e culinária", "literatura",
+    "videogames", "corpo humano", "invenções", "cultura brasileira",
+    "matemática divertida", "língua portuguesa", "arte", "natureza",
+]
+
+
+def _quiz_prompt(jid: str) -> str:
+    """Prompt com tema aleatório + anti-repetição das últimas perguntas do chat."""
+    tema = random.choice(QUIZ_TEMAS)
+    recentes = _quiz_recent.get(jid, [])[-6:]
+    evitar = (
+        " NÃO repita nem fique parecido com estas perguntas já feitas neste chat: "
+        + " | ".join(f'"{p}"' for p in recentes)
+        if recentes
+        else ""
+    )
+    return (
+        f"Gere UMA pergunta de trivia em português sobre {tema}. "
+        "Seja criativo e específico. "
+        'Responda SOMENTE com JSON válido, sem markdown: {"pergunta": "...", '
+        '"alternativas": {"a": "...", "b": "...", "c": "...", "d": "..."}, "correta": "a|b|c|d"}'
+        + evitar
+    )
 _FORCA_WORDS = [
     "python", "servidor", "abacaxi", "janela", "chuveiro", "girafa", "pipoca",
     "teclado", "bicicleta", "sorvete", "castelo", "jacare", "violao", "cogumelo",
@@ -1655,12 +1683,13 @@ async def _cmd_quiz(request: web.Request, jid: str, args: str) -> None:
         await _try_send(request, jid, f"{verdict}\n`.quiz` pra próxima")
         return
     await _try_send(request, jid, "🎲 Gerando pergunta...")
-    raw = await ask_ai(request.app["http"], jid, QUIZ_PROMPT, use_history=False)
+    raw = await ask_ai(request.app["http"], jid, _quiz_prompt(jid), use_history=False)
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
         raise RuntimeError(f"quiz sem JSON: {raw[:150]}")
     q = json.loads(match.group(0))
     alts = q["alternativas"]
+    _quiz_recent.setdefault(jid, []).append(str(q.get("pergunta", ""))[:120])
     _quiz_state[jid] = {"correta": str(q["correta"]).lower(), "ts": time.time()}
     lines = [f"❓ {q['pergunta']}"] + [f"{k}) {v}" for k, v in sorted(alts.items())]
     lines.append("\nResponda: `.quiz <a-d>`")
