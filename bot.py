@@ -1241,8 +1241,15 @@ async def send_sticker(
     """Envia figurinha; media_url (terminando em .webp) preserva animacao."""
     url = f"{EVOLUTION_URL}/message/sendSticker/{INSTANCE}"
     headers = {"apikey": EVOLUTION_API_KEY}
-    sticker_field = media_url if media_url else sticker_b64
-    payload = {"number": number, "sticker": sticker_field, "delay": delay_ms}
+    # notConvertSticker: Evolution v2 usa os bytes crus -> EXIF do pack sobrevive
+    payload = {
+        "number": number,
+        "sticker": sticker_b64,
+        "delay": delay_ms,
+        "notConvertSticker": True,
+    }
+    if media_url:
+        payload["sticker"] = media_url
     async with session.post(
         url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=60)
     ) as resp:
