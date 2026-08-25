@@ -899,6 +899,8 @@ async def _find_recent_media(session: aiohttp.ClientSession, remote_jid: str):
         records = ((d or {}).get("messages") or {}).get("records") or []
         cutoff = time.time() - 600  # so midia dos ultimos 10 minutos
         for rec in records:
+            if (rec.get("key") or {}).get("fromMe"):
+                continue
             mt = rec.get("messageType")
             if mt in ("videoMessage", "imageMessage"):
                 ts = float(rec.get("messageTimestamp") or 0)
@@ -2318,20 +2320,63 @@ def _next_poll_interval(current: float, fetched: bool) -> float:
     return min(float(POLL_INTERVAL_S), max(float(_POLL_BACKOFF_START_S), current * 2))
 
 
+async def _list_recent_chats(session: aiohttp.ClientSession) -> list[tuple[str, bool, float]]:
+    """[(remoteJid, is_group, updatedAt_ts)] de todos os chats via /chat/findChats."""
+    try:
+        async with session.post(
+            f"{EVOLUTION_URL}/chat/findChats/{INSTANCE}",
+            json={}, headers={"apikey": EVOLUTION_API_KEY},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            if resp.status != 200:
+                return []
+            d = await resp.json(content_type=None)
+        out = []
+        for c in d or []:
+            if not isinstance(c, dict) or not c.get("remoteJid"):
+                continue
+            jid = c["remoteJid"]
+            upd = 0.0
+            try:
+                upd = datetime.fromisoformat(
+                    str(c.get("updatedAt", "")).replace("Z", "+00:00")
+                ).timestamp()
+            except Exception:  # noqa: BLE001
+                pass
+            out.append((jid, "@g.us" in jid, upd))
+        return out
+    except Exception as exc:  # noqa: BLE001
+        log.error("[MPOLL] findChats falhou: %s", exc)
+        return []
+
+
 async def _media_poller(app: web.Application):
-    """Processa midias que a Evolution falhou em emitir — so em chats com .s recente."""
+    """Recupera midias que a Evolution falhou em emitir via webhook.
+
+    - Chats privados: midia nova vira figurinha automatica (proposito do bot).
+    - Grupos: so com intencao .s recente (evita spam e vazamento entre chats).
+    - Nunca processa fromMe; caps anti-ban seguem valendo.
+    """
     session = app["http"]
     await asyncio.sleep(15)
     while True:
         try:
             agora = time.time()
-            alvos = [j for j, t in list(_sticker_intent.items()) if agora - t < 300]
+            alvos_grupo = [j for j, t in list(_sticker_intent.items()) if agora - t < 300]
             for j in [_j for _j in list(_sticker_intent) if agora - _sticker_intent[_j] >= 300]:
                 _sticker_intent.pop(j, None)
-            if not alvos:
+
+            if _panel_state.get("instance") != "open":
                 await asyncio.sleep(10)
                 continue
-            for jid in alvos:
+
+            for jid, is_group, updated in await _list_recent_chats(session):
+                # chat sem atividade recente: nada a fazer
+                if updated and agora - updated > 600:
+                    continue
+                # grupos exigem intencao .s explicita
+                if is_group and jid not in alvos_grupo:
+                    continue
                 recent = await _find_recent_media(session, jid)
                 if not recent:
                     continue
@@ -2352,10 +2397,12 @@ async def _media_poller(app: web.Application):
                         not_convert=True,
                     )
                     _register_send(jid)
-                    log.info("[MPOLL] figurinha (%s) enviada pra %s", kind, jid[:20])
-                    _sticker_intent.pop(jid, None)
+                    log.info(
+                        "[MPOLL] figurinha (%s) enviada | chat=%s | hoje %d/%d",
+                        kind, jid[:24], _state["sent_today"], DAILY_SEND_CAP,
+                    )
                 except Exception as exc:  # noqa: BLE001
-                    log.error("[MPOLL] conversao falhou: %s", exc)
+                    log.error("[MPOLL] conversao falhou (%s): %s", kind, exc)
         except Exception as exc:  # noqa: BLE001
             log.error("[MPOLL] ciclo falhou: %s", exc)
         await asyncio.sleep(10)
