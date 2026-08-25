@@ -1231,6 +1231,8 @@ async def make_video_sticker_raw(video_b64: str) -> bytes:
             tail = (stderr or b"").decode(errors="replace")[-300:]
             raise RuntimeError(f"ffmpeg falhou: {tail}")
         raw = outp.read_bytes()
+        # Variante validada em producao (25/08): ffmpeg cru + mux EXIF + notConvertSticker
+        return _mux_exif_after_vp8x(raw, _sticker_exif(STICKER_PACK_NAME, STICKER_AUTHOR))
     return _mux_exif_after_vp8x(raw, _sticker_exif(STICKER_PACK_NAME, STICKER_AUTHOR))
 
 
@@ -1240,14 +1242,14 @@ async def send_sticker(
     sticker_b64: str,
     delay_ms: int,
     *,
-    media_url: str | None = None,
+    not_convert: bool = False,
 ) -> None:
-    """Envia figurinha; media_url (terminando em .webp) preserva animacao."""
+    """Envia figurinha; not_convert preserva bytes crus (EXIF do pack + animacao)."""
     url = f"{EVOLUTION_URL}/message/sendSticker/{INSTANCE}"
     headers = {"apikey": EVOLUTION_API_KEY}
     payload = {"number": number, "sticker": sticker_b64, "delay": delay_ms}
-    if media_url:
-        payload["sticker"] = media_url  # URL .webp preserva animacao
+    if not_convert:
+        payload["notConvertSticker"] = True
     async with session.post(
         url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=60)
     ) as resp:
@@ -1962,18 +1964,8 @@ async def handle_webhook(request: web.Request) -> web.Response:
             await _try_send(request, remote_jid, "Não consegui baixar essa mídia 😅")
             return web.json_response({"ok": False, "error": "no-media"}, status=502)
         try:
-            media_url_for_send = None
             if has_video and not quoted_sticker:
                 sticker_raw = await make_video_sticker_raw(media_b64)
-                try:
-                    _MEDIA_SERVE_DIR.mkdir(parents=True, exist_ok=True)
-                    fname = f"st-{int(time.time()*1000)}.webp"
-                    (_MEDIA_SERVE_DIR / fname).write_bytes(sticker_raw)
-                    media_url_for_send = (
-                        f"http://172.17.0.1:{BOT_PORT}/media/{fname}?t={WEBHOOK_TOKEN}"
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("[STICKER] servico de URL falhou: %s", exc)
             else:
                 sticker_raw = make_sticker_raw(media_b64)
             sticker_b64 = base64.b64encode(sticker_raw).decode()
@@ -1988,7 +1980,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
                 _send_number(remote_jid),
                 sticker_b64,
                 humanize_delay_ms("figurinha"),
-                media_url=media_url_for_send,
+                not_convert=True,
             )
             sent = True
         except Exception as exc:  # noqa: BLE001
@@ -2314,23 +2306,12 @@ async def _media_poller(app: web.Application):
                                     if kind == "video"
                                     else make_sticker_raw(b64)
                                 )
-                                _MEDIA_SERVE_DIR.mkdir(parents=True, exist_ok=True)
-                                fname_p = f"st-{mid[:12]}.webp"
-                                (_MEDIA_SERVE_DIR / fname_p).write_bytes(sticker_raw)
-                                m_url = f"http://172.17.0.1:{BOT_PORT}/media/{fname_p}?t={WEBHOOK_TOKEN}"
-                                try:
-                                    await send_sticker(
-                                        session, _send_number(jid),
-                                        base64.b64encode(sticker_raw).decode(),
-                                        humanize_delay_ms("figurinha"),
-                                        media_url=m_url,
-                                    )
-                                except Exception:  # noqa: BLE001
-                                    await send_sticker(
-                                        session, _send_number(jid),
-                                        base64.b64encode(sticker_raw).decode(),
-                                        humanize_delay_ms("figurinha"),
-                                    )
+                                await send_sticker(
+                                    session, _send_number(jid),
+                                    base64.b64encode(sticker_raw).decode(),
+                                    humanize_delay_ms("figurinha"),
+                                    not_convert=True,
+                                )
                                 _register_send(jid)
                                 log.info("[MPOLL] -> figurinha enviada (%s)", kind)
                             except Exception as exc:  # noqa: BLE001
