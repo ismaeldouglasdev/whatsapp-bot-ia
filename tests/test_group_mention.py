@@ -70,12 +70,14 @@ def test_gate_usa_probe_original_nao_stripped():
     assert not bot._MENTION_TEXT_RE.search(stripped)
 
 
-def test_send_number_prefere_alt_lid():
+def test_send_number_prefere_alt_e_lid_completo():
     bot._jid_alt.clear()
     bot._jid_alt["144852201267289@lid"] = "5511959873202@s.whatsapp.net"
     assert bot._send_number("144852201267289@lid") == "5511959873202"
     assert bot._send_number("5599@s.whatsapp.net") == "5599"
     bot._jid_alt.clear()
+    # sem alt conhecida: JID @lid completo (Evolution aceita)
+    assert bot._send_number("144852201267289@lid") == "144852201267289@lid"
 
 
 def test_alias_s_tratado_no_webhook():

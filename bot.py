@@ -831,10 +831,13 @@ _jid_alt: dict[str, str] = {}
 
 
 def _send_number(remote_jid: str) -> str:
-    """Preferencia pelo numero real (remoteJidAlt) quando o chat ve como @lid."""
+    """Destinatario para send*: numero real (alt), JID @lid completo, ou digitos."""
     alt = _jid_alt.get(remote_jid)
-    base = alt or remote_jid
-    return base.split("@")[0]
+    if alt:
+        return alt.split("@")[0]
+    if remote_jid.endswith("@lid"):
+        return remote_jid  # Evolution aceita JID @lid completo
+    return remote_jid.split("@")[0]
 
 
 
@@ -2223,6 +2226,69 @@ def _next_poll_interval(current: float, fetched: bool) -> float:
     return min(float(POLL_INTERVAL_S), max(float(_POLL_BACKOFF_START_S), current * 2))
 
 
+async def _list_chat_jids(session: aiohttp.ClientSession) -> list[str]:
+    """JIDs de todos os chats ativos via /chat/findChats."""
+    try:
+        async with session.post(
+            f"{EVOLUTION_URL}/chat/findChats/{INSTANCE}",
+            json={}, headers={"apikey": EVOLUTION_API_KEY},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            if resp.status != 200:
+                return []
+            d = await resp.json(content_type=None)
+        return [c["remoteJid"] for c in (d or []) if isinstance(c, dict) and c.get("remoteJid")]
+    except Exception as exc:  # noqa: BLE001
+        log.error("[MPOLL] findChats falhou: %s", exc)
+        return []
+
+
+async def _media_poller(app: web.Application):
+    """Varre chats conhecidos via findMessages e processa midias perdidas.
+
+    A v2.3.7 falha silenciosamente ao emitir webhook para algumas midias
+    (video+LID); este poller garante que toda midia recente seja convertida.
+    """
+    global _app_ref
+    session = app["http"]
+    await asyncio.sleep(20)  # deixa a sessao assentar apos o boot
+    while True:
+        try:
+            if _app_ref is not None and _panel_state.get("instance") == "open":
+                jids = await _list_chat_jids(session)
+                log.info("[MPOLL] varredura: %d chats", len(jids))
+                for jid in jids:
+                    recent = await _find_recent_media(session, jid)
+                    if recent:
+                        mid, kind, k_r, m_r = recent
+                        b64 = await download_media(session, {"key": k_r, "message": m_r})
+                        if b64:
+                            data_fake = {
+                                "key": {**k_r, "remoteJid": jid},
+                                "pushName": "",
+                                "message": {("videoMessage" if kind == "video" else "imageMessage"): {}},
+                            }
+                            log.info("[MPOLL] midia recuperada %s (%s)", mid[:12], kind)
+                            try:
+                                sticker_raw = (
+                                    await make_video_sticker_raw(b64)
+                                    if kind == "video"
+                                    else make_sticker_raw(b64)
+                                )
+                                await send_sticker(
+                                    session, _send_number(jid),
+                                    base64.b64encode(sticker_raw).decode(),
+                                    humanize_delay_ms("figurinha"),
+                                )
+                                _register_send(jid)
+                                log.info("[MPOLL] -> figurinha enviada (%s)", kind)
+                            except Exception as exc:  # noqa: BLE001
+                                log.error("[MPOLL] conversao falhou: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.error("[MPOLL] ciclo falhou: %s", exc)
+        await asyncio.sleep(15)
+
+
 async def _poll_instance_state(app: web.Application):
     """Polla periodicamente o estado da instancia; watchdog age se prega."""
     global _conn_bad_streak, _post_restart_polls, _watchdog_suspended_until
@@ -2276,12 +2342,15 @@ async def http_session_ctx(app: web.Application):
     _app_ref = app
     app["http"] = aiohttp.ClientSession()
     poller = asyncio.create_task(_poll_instance_state(app))
+    media_poller = asyncio.create_task(_media_poller(app))
     yield
     poller.cancel()
-    try:
-        await poller
-    except asyncio.CancelledError:
-        pass
+    media_poller.cancel()
+    for t in (poller, media_poller):
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
     await app["http"].close()
 
 
