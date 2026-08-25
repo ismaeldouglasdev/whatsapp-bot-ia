@@ -1870,8 +1870,10 @@ async def handle_webhook(request: web.Request) -> web.Response:
                     humanize_delay_ms("figurinha"),
                 )
                 _register_send(remote_jid)
-                log.info("→ figurinha (.s) enviada | hoje %d/%d",
-                         _state["sent_today"], DAILY_SEND_CAP)
+                log.info(
+                    "→ figurinha (.s) enviada | kind=%s mid=%s | hoje %d/%d",
+                    kind, _mid[:12] if _mid else "?", _state["sent_today"], DAILY_SEND_CAP,
+                )
                 return web.json_response({"ok": True, "action": "sticker-s"})
             except Exception as exc:  # noqa: BLE001
                 log.error("[.s] conversao falhou: %s", exc)
