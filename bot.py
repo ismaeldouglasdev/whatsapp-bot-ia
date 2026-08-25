@@ -869,6 +869,7 @@ def _media_cache_put(msg_id: str, kind: str, b64: str) -> None:
 
 
 _media_seen: set[str] = set()
+_sticker_intent: dict[str, float] = {}  # jid -> ts do ultimo .s sem midia
 
 
 def _media_seen_once(mid: str | None) -> bool:
@@ -1943,9 +1944,10 @@ async def handle_webhook(request: web.Request) -> web.Response:
                 log.error("[.s] conversao falhou: %s", exc)
                 await _try_send(request, remote_jid, "Não consegui converter essa mídia 😅")
                 return web.json_response({"ok": False}, status=502)
+        _sticker_intent[remote_jid] = time.time()
         await _try_send(
             request, remote_jid,
-            "Não achei mídia recente nesse chat 📎 manda a imagem/vídeo e manda .s em seguida",
+            "Não achei mídia recente 📎 manda a imagem/vídeo agora que eu converto!",
         )
         return web.json_response({"ok": True, "action": "sticker-miss"})
 
@@ -2304,6 +2306,49 @@ def _next_poll_interval(current: float, fetched: bool) -> float:
     return min(float(POLL_INTERVAL_S), max(float(_POLL_BACKOFF_START_S), current * 2))
 
 
+async def _media_poller(app: web.Application):
+    """Processa midias que a Evolution falhou em emitir — so em chats com .s recente."""
+    session = app["http"]
+    await asyncio.sleep(15)
+    while True:
+        try:
+            agora = time.time()
+            alvos = [j for j, t in list(_sticker_intent.items()) if agora - t < 300]
+            for j in [_j for _j in list(_sticker_intent) if agora - _sticker_intent[_j] >= 300]:
+                _sticker_intent.pop(j, None)
+            if not alvos:
+                await asyncio.sleep(10)
+                continue
+            for jid in alvos:
+                recent = await _find_recent_media(session, jid)
+                if not recent:
+                    continue
+                mid, kind, k_r, m_r = recent
+                b64 = await download_media(session, {"key": k_r, "message": m_r})
+                if not b64:
+                    continue
+                try:
+                    sticker_raw = (
+                        await make_video_sticker_raw(b64)
+                        if kind == "video"
+                        else make_sticker_raw(b64)
+                    )
+                    await send_sticker(
+                        session, _send_number(jid),
+                        base64.b64encode(sticker_raw).decode(),
+                        humanize_delay_ms("figurinha"),
+                        not_convert=True,
+                    )
+                    _register_send(jid)
+                    log.info("[MPOLL] figurinha (%s) enviada pra %s", kind, jid[:20])
+                    _sticker_intent.pop(jid, None)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("[MPOLL] conversao falhou: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.error("[MPOLL] ciclo falhou: %s", exc)
+        await asyncio.sleep(10)
+
+
 async def _poll_instance_state(app: web.Application):
     """Polla periodicamente o estado da instancia; watchdog age se prega."""
     global _conn_bad_streak, _post_restart_polls, _watchdog_suspended_until
@@ -2357,13 +2402,16 @@ async def http_session_ctx(app: web.Application):
     _app_ref = app
     app["http"] = aiohttp.ClientSession()
     poller = asyncio.create_task(_poll_instance_state(app))
+    media_poller = asyncio.create_task(_media_poller(app))
 
     yield
     poller.cancel()
-    try:
-        await poller
-    except asyncio.CancelledError:
-        pass
+    media_poller.cancel()
+    for t in (poller, media_poller):
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
     await app["http"].close()
 
 
