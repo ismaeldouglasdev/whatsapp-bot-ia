@@ -1201,7 +1201,7 @@ async def make_video_sticker_raw(video_b64: str) -> bytes:
     if video_b64.strip().startswith("data:"):
         _, _, video_b64 = video_b64.partition(",")
     vf = (
-        f"fps=15,scale={STICKER_SIZE}:{STICKER_SIZE}"
+        f"fps=10,scale={STICKER_SIZE}:{STICKER_SIZE}"
         ":force_original_aspect_ratio=increase,crop="
         f"{STICKER_SIZE}:{STICKER_SIZE},scale={STICKER_SIZE}:{STICKER_SIZE}"
     )
@@ -1215,7 +1215,7 @@ async def make_video_sticker_raw(video_b64: str) -> bytes:
             "-t", str(STICKER_MAX_VIDEO_S),
             "-vf", vf,
             "-c:v", "libwebp",
-            "-quality", "80",
+            "-quality", "70",
             "-loop", "0",
             "-an",
             str(outp),
@@ -1241,15 +1241,9 @@ async def send_sticker(
     """Envia figurinha; media_url (terminando em .webp) preserva animacao."""
     url = f"{EVOLUTION_URL}/message/sendSticker/{INSTANCE}"
     headers = {"apikey": EVOLUTION_API_KEY}
-    # notConvertSticker: Evolution v2 usa os bytes crus -> EXIF do pack sobrevive
-    payload = {
-        "number": number,
-        "sticker": sticker_b64,
-        "delay": delay_ms,
-        "notConvertSticker": True,
-    }
+    payload = {"number": number, "sticker": sticker_b64, "delay": delay_ms}
     if media_url:
-        payload["sticker"] = media_url
+        payload["sticker"] = media_url  # URL .webp preserva animacao
     async with session.post(
         url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=60)
     ) as resp:
