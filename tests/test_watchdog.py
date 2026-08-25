@@ -88,3 +88,22 @@ def test_boot_backoff_exponencial_cap_30():
 
 def test_sucesso_volta_ritmo_normal():
     assert bot._next_poll_interval(16.0, fetched=True) == 30.0
+
+
+def test_find_recent_ignora_midia_antiga():
+    import time as _t
+    from unittest.mock import patch
+    recs = {"messages": {"records": [
+        {"key": {"id": "VELHO"}, "messageType": "videoMessage",
+         "message": {}, "messageTimestamp": int(_t.time()) - 3600},
+    ]}}
+    class R:
+        status = 200
+        async def json(self, **k): return recs
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+    class S:
+        def post(self, *a, **k): return R()
+    bot._media_seen.clear()
+    got = asyncio.run(bot._find_recent_media(S(), "x@s.whatsapp.net"))
+    assert got is None  # midia de 1h atras ignorada

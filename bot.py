@@ -892,9 +892,13 @@ async def _find_recent_media(session: aiohttp.ClientSession, remote_jid: str):
                 return None
             d = await resp.json(content_type=None)
         records = ((d or {}).get("messages") or {}).get("records") or []
+        cutoff = time.time() - 600  # so midia dos ultimos 10 minutos
         for rec in records:
             mt = rec.get("messageType")
             if mt in ("videoMessage", "imageMessage"):
+                ts = float(rec.get("messageTimestamp") or 0)
+                if ts and ts < cutoff:
+                    continue  # midia antiga: nunca reprocessar
                 k = rec.get("key") or {}
                 mid = k.get("id")
                 if mid and _media_seen_once(mid):
