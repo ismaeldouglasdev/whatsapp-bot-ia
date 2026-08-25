@@ -113,3 +113,24 @@ def test_ordenacao_saudavel_primeiro():
     out = asyncio.run(bot.ask_ai(s, "chat", "oi", use_history=False))
     assert out == "via-a"
     assert s.attempted == ["modelo-a"]
+
+
+def test_ordenacao_prefere_mais_rapido_com_saude_igual():
+    reset()
+    # ambos 100% ok, mas B respondeu 3x mais rápido no histórico
+    bot._ia_stats["modelo-a"] = {"ok": 4, "fail": 0, "last_ms": 9000}
+    bot._ia_stats["modelo-b"] = {"ok": 4, "fail": 0, "last_ms": 1500}
+    s = FakeSession([(200, ok_body("rapido"))])
+    out = asyncio.run(bot.ask_ai(s, "chat", "oi", use_history=False))
+    assert s.attempted[0] == "modelo-b"
+    assert out == "rapido"
+
+
+def test_saude_pesa_mais_que_velocidade():
+    reset()
+    # A rápido mas instável (50%), B lento porém sólido (100%)
+    bot._ia_stats["modelo-a"] = {"ok": 2, "fail": 2, "last_ms": 800}
+    bot._ia_stats["modelo-b"] = {"ok": 6, "fail": 0, "last_ms": 6000}
+    s = FakeSession([(200, ok_body("via-b"))])
+    asyncio.run(bot.ask_ai(s, "chat", "oi", use_history=False))
+    assert s.attempted[0] == "modelo-b"

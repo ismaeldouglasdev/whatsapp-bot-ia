@@ -1011,12 +1011,20 @@ async def ask_ai(
         if m not in healthy:
             log.info("[IA] %s em cooldown %.0fs - pulando", m, _model_cooldown[m] - now)
 
-    def _ratio(m):
+    def _score(m):
+        """Saúde x velocidade: prioriza modelos que respondem rápido com sucesso."""
         s = _ia_stats.get(m) or {}
         ok = s.get("ok", 0)
-        return ok / max(1, ok + s.get("fail", 0))
+        ratio = ok / max(1, ok + s.get("fail", 0))
+        last_ms = s.get("last_ms")
+        if not last_ms:
+            speed = 1.0
+        else:
+            # 3s = neutro; 750ms -> 1.5 (cap); 12s -> 0.25
+            speed = max(0.25, min(1.5, 3000 / max(250, last_ms)))
+        return ratio * 0.8 + speed * 0.2
 
-    models = sorted(healthy, key=_ratio, reverse=True)
+    models = sorted(healthy, key=_score, reverse=True)
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if use_history:
