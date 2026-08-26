@@ -1830,6 +1830,27 @@ def _dl_state_prune() -> None:
         _DL_STATE.pop(j, None)
 
 
+async def _to_voice_note(mp3_path: str) -> str | None:
+    """Converte mp3 para ogg opus (formato de nota de voz do WhatsApp)."""
+    ogg = mp3_path.rsplit(".", 1)[0] + ".ogg"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", mp3_path,
+            "-c:a", "libopus", "-b:a", "64k", "-application", "voip",
+            ogg,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
+    except Exception as exc:  # noqa: BLE001
+        log.error("[DL] ffmpeg ptt falhou: %s", exc)
+        return None
+    if proc.returncode != 0 or not os.path.exists(ogg):
+        log.error("[DL] ffmpeg rc=%s: %s", proc.returncode, stderr.decode(errors="replace")[-200:])
+        return None
+    return ogg
+
+
 async def _run_ytdlp(url: str, modo: str, tmpdir: str) -> str | None:
     """Baixa via yt-dlp; retorna caminho do arquivo ou None."""
     if modo == "audio":
@@ -1869,6 +1890,8 @@ async def _run_ytdlp(url: str, modo: str, tmpdir: str) -> str | None:
             if os.path.getsize(caminho) > DL_MAX_FILE_MB * 1024 * 1024:
                 log.error("[DL] arquivo %.1fMB acima do limite %dMB", os.path.getsize(caminho) / 1048576, DL_MAX_FILE_MB)
                 return None
+            if modo == "audio":
+                caminho = await _to_voice_note(caminho) or caminho
             return caminho
     return None
 
@@ -1915,7 +1938,10 @@ async def _dl_execute(request: web.Request, jid: str, modo: str) -> None:
         with open(caminho, "rb") as fh:
             b64 = base64.b64encode(fh.read()).decode()
         if modo == "audio":
-            mt, mime, fname = "audio", "audio/mpeg", "audio.mp3"
+            eh_voz = caminho.endswith(".ogg")
+            mt = "audio"
+            mime = "audio/ogg; codecs=opus" if eh_voz else "audio/mpeg"
+            fname = "audio.ogg" if eh_voz else "audio.mp3"
         else:
             mt, mime, fname = "video", "video/mp4", "video.mp4"
         await send_media_file(
