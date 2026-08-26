@@ -1798,6 +1798,191 @@ async def _cmd_quiz(request: web.Request, jid: str, args: str) -> None:
     await _try_send(request, jid, "\n".join(lines))
 
 
+# ---------------------------------------------------------------------------
+# Menu de downloads (TikTok / Instagram / YouTube via yt-dlp)
+# ---------------------------------------------------------------------------
+DL_ENABLED = os.environ.get("DL_ENABLED", "1") == "1"
+DL_MAX_FILE_MB = int(os.environ.get("DL_MAX_FILE_MB", "50"))
+DL_TIMEOUT_S = int(os.environ.get("DL_TIMEOUT_S", "120"))
+_DL_STATE: dict[str, dict] = {}
+
+_DL_PLATFORMS = {
+    "tiktok": re.compile(r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/\S+", re.I),
+    "instagram": re.compile(r"https?://(?:www\.)?instagram\.com/(?:reel|p|tv)/\S+", re.I),
+    "youtube": re.compile(
+        r"https?://(?:www\.|m\.)?(?:youtube\.com/(?:shorts|watch)\S*|youtu\.be/\S+)", re.I
+    ),
+}
+
+
+def _detect_platform(text: str) -> tuple[str, str] | None:
+    """(plataforma, url) do primeiro link suportado no texto; None se nada."""
+    for nome, rx in _DL_PLATFORMS.items():
+        m = rx.search(text)
+        if m:
+            return nome, m.group(0).rstrip(").,;")
+    return None
+
+
+def _dl_state_prune() -> None:
+    agora = time.time()
+    for j in [j for j, s in _DL_STATE.items() if agora - s["ts"] > 300]:
+        _DL_STATE.pop(j, None)
+
+
+async def _run_ytdlp(url: str, modo: str, tmpdir: str) -> str | None:
+    """Baixa via yt-dlp; retorna caminho do arquivo ou None."""
+    if modo == "audio":
+        cmd = [
+            "yt-dlp", "-x", "--audio-format", "mp3", "--audio-quality", "5",
+            "-o", f"{tmpdir}/audio.%(ext)s", "--no-playlist", url,
+        ]
+    else:
+        cmd = [
+            "yt-dlp", "-f",
+            "b[height<=720][ext=mp4]/bv*[height<=720]+ba/b[height<=720]/b",
+            "--merge-output-format", "mp4",
+            "-o", f"{tmpdir}/video.%(ext)s", "--no-playlist", url,
+        ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=tmpdir,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=DL_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        proc.kill()
+        log.error("[DL] timeout %ss em %s", DL_TIMEOUT_S, url[:60])
+        return None
+    except FileNotFoundError:
+        log.error("[DL] yt-dlp nao encontrado no sistema")
+        return None
+    if proc.returncode != 0:
+        log.error("[DL] yt-dlp rc=%s: %s", proc.returncode, stderr.decode(errors="replace")[-300:])
+        return None
+    prefixo = "audio." if modo == "audio" else "video."
+    for f in sorted(os.listdir(tmpdir)):
+        if f.startswith(prefixo):
+            caminho = os.path.join(tmpdir, f)
+            if os.path.getsize(caminho) > DL_MAX_FILE_MB * 1024 * 1024:
+                log.error("[DL] arquivo %.1fMB acima do limite %dMB", os.path.getsize(caminho) / 1048576, DL_MAX_FILE_MB)
+                return None
+            return caminho
+    return None
+
+
+async def send_media_file(
+    session: aiohttp.ClientSession, number: str, b64: str,
+    mediatype: str, mimetype: str, file_name: str, delay_ms: int,
+) -> None:
+    url = f"{EVOLUTION_URL}/message/sendMedia/{INSTANCE}"
+    headers = {"apikey": EVOLUTION_API_KEY}
+    payload = {
+        "number": number,
+        "mediaMessage": {
+            "mediatype": mediatype,
+            "mimetype": mimetype,
+            "media": b64,
+            "fileName": file_name,
+        },
+        "delay": delay_ms,
+    }
+    async with session.post(
+        url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=180)
+    ) as resp:
+        body = await resp.json(content_type=None)
+        if resp.status not in (200, 201):
+            raise RuntimeError(f"sendMedia HTTP {resp.status}: {str(body)[:200]}")
+
+
+async def _dl_execute(request: web.Request, jid: str, modo: str) -> None:
+    """Executa o download pendente do chat e envia o arquivo."""
+    st = _DL_STATE.pop(jid, None)
+    if not st:
+        await _try_send(request, jid, "Não tem link pendente aqui 😅 manda um link do TikTok/Instagram/YouTube")
+        return
+    plataforma, url = st["plataforma"], st["url"]
+    emoji = "🎬" if modo == "video" else "🎵"
+    await _try_send(request, jid, f"⏳ Baixando {modo} do {plataforma}...")
+    tmpdir = tempfile.mkdtemp(prefix="wabot_dl_")
+    try:
+        caminho = await _run_ytdlp(url, modo, tmpdir)
+        if not caminho:
+            await _try_send(request, jid, "❌ Não consegui baixar esse link. Pode ser privado, removido ou a plataforma bloqueou 😕")
+            return
+        with open(caminho, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode()
+        if modo == "audio":
+            mt, mime, fname = "audio", "audio/mpeg", "audio.mp3"
+        else:
+            mt, mime, fname = "video", "video/mp4", "video.mp4"
+        await send_media_file(
+            request.app["http"], _send_number(jid), b64, mt, mime, fname,
+            humanize_delay_ms("download"),
+        )
+        _register_send(jid)
+        log.info("[DL] %s/%s enviado (%.1fMB) | hoje %d/%d",
+                 plataforma, modo, len(b64) * 0.75 / 1048576, _state["sent_today"], DAILY_SEND_CAP)
+    except Exception as exc:  # noqa: BLE001
+        log.error("[DL] falha: %s", exc)
+        await _try_send(request, jid, "💥 Deu ruim ao enviar o arquivo. Tenta de novo!")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+_DL_MENU = (
+    "🔗 *{plat}* detectado!{extra}\n\n"
+    "1️⃣ Vídeo 🎬\n"
+    "2️⃣ Áudio 🎵\n\n"
+    "_Responda 1 ou 2 (expira em 5min)_"
+)
+
+
+_DL_DISPLAY = {"tiktok": "TikTok", "instagram": "Instagram", "youtube": "YouTube"}
+
+
+def _dl_menu_send(plataforma: str) -> str:
+    extra = "\n⚠️ Instagram às vezes exige perfil público" if plataforma == "instagram" else ""
+    return _DL_MENU.format(plat=_DL_DISPLAY.get(plataforma, plataforma), extra=extra)
+
+
+async def _dl_handle(request: web.Request, jid: str, text: str) -> bool:
+    """True se a mensagem era escolha do menu ou link novo (consumida)."""
+    _dl_state_prune()
+    st = _DL_STATE.get(jid)
+    if st:
+        t = text.strip().lower()
+        if t in ("1", "2", "vídeo", "video", "áudio", "audio"):
+            await _dl_execute(request, jid, "video" if t in ("1", "vídeo", "video") else "audio")
+            return True
+        _DL_STATE.pop(jid, None)
+    det = _detect_platform(text)
+    if not det:
+        return False
+    plataforma, url = det
+    _DL_STATE[jid] = {"plataforma": plataforma, "url": url, "ts": time.time()}
+    await _try_send(request, jid, _dl_menu_send(plataforma))
+    _register_send(jid)
+    log.info("[DL] menu aberto | %s | %s", plataforma, url[:60])
+    return True
+
+
+async def _cmd_dl(request: web.Request, jid: str, args: str) -> None:
+    if not args.strip():
+        await _try_send(request, jid, "Uso: `.dl <link>` — TikTok, Instagram ou YouTube")
+        return
+    det = _detect_platform(args)
+    if not det:
+        await _try_send(request, jid, "🤔 Só suporto links do TikTok, Instagram e YouTube por enquanto")
+        return
+    plataforma, url = det
+    _DL_STATE[jid] = {"plataforma": plataforma, "url": url, "ts": time.time()}
+    await _try_send(request, jid, _dl_menu_send(plataforma))
+
+
+
 CommandHandler = Callable[[web.Request, str, str], Awaitable[None]]
 
 async def _cmd_reset(request: web.Request, jid: str, args: str) -> None:
@@ -1969,6 +2154,7 @@ COMMANDS: dict[str, CommandHandler] = {
     "reset": _cmd_reset,
     "resumo": _cmd_resumo,
     "traduz": _cmd_traduz,
+    "dl": _cmd_dl,
     "lembrar": _cmd_lembrar,
     "piada": _cmd_piada,
 }
@@ -2206,6 +2392,10 @@ async def handle_webhook(request: web.Request) -> web.Response:
             _last_data.pop(_k, None)
     if text[:1] in (".", "!") and await dispatch_command(request, remote_jid, text, key=key):
         return web.json_response({"ok": True, "action": "command"})
+
+    # --- Menu de downloads (escolha pendente ou link novo) --------------------
+    if DL_ENABLED and text and await _dl_handle(request, remote_jid, text):
+        return web.json_response({"ok": True, "action": "download"})
 
     # --- IA + resposta -------------------------------------------------------
     try:
