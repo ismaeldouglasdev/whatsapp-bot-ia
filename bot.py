@@ -1968,12 +1968,10 @@ async def send_media_file(
     headers = {"apikey": EVOLUTION_API_KEY}
     payload = {
         "number": number,
-        "mediaMessage": {
-            "mediatype": mediatype,
-            "mimetype": mimetype,
-            "media": b64,
-            "fileName": file_name,
-        },
+        "mediatype": mediatype,
+        "mimetype": mimetype,
+        "media": b64,
+        "fileName": file_name,
         "delay": delay_ms,
     }
     async with session.post(
@@ -2421,8 +2419,14 @@ async def handle_webhook(request: web.Request) -> web.Response:
         log.info("[fora do horário %s] %s", ACTIVE_HOURS, push_name)
         return web.json_response({"ok": True, "skipped": "inactive-hours"})
 
-    # Comandos explicitos (.foo / !foo) nunca caem no rate-limit — so respostas de IA.
-    if not (text[:1] in (".", "!")):
+    # Comandos (.foo/!foo) e escolhas de menu pendente nunca caem no rate-limit.
+    _dl_state_prune()
+    escolha_menu = bool(
+        text
+        and remote_jid in _DL_STATE
+        and text.strip().lower() in ("1", "2", "vídeo", "video", "áudio", "audio")
+    )
+    if not (text[:1] in (".", "!") or escolha_menu):
         reason = _rate_block_reason(remote_jid)
         if reason:
             log.warning("[RATE LIMIT: %s] mensagem de %s ignorada", reason, push_name)
