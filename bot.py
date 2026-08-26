@@ -1851,6 +1851,70 @@ async def _to_voice_note(mp3_path: str) -> str | None:
     return ogg
 
 
+_TIKWM_API = "https://tikwm.com/api/"
+
+
+async def _download_direct(
+    session: aiohttp.ClientSession, url: str, dest: str
+) -> str | None:
+    """Baixa arquivo de CDN em streaming, respeitando o limite de tamanho."""
+    try:
+        async with session.get(
+            url,
+            timeout=aiohttp.ClientTimeout(total=DL_TIMEOUT_S),
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as resp:
+            if resp.status != 200:
+                log.error("[DL] CDN HTTP %s", resp.status)
+                return None
+            limite = DL_MAX_FILE_MB * 1024 * 1024
+            total = 0
+            with open(dest, "wb") as fh:
+                async for chunk in resp.content.iter_chunked(65536):
+                    total += len(chunk)
+                    if total > limite:
+                        log.error("[DL] stream excedeu %dMB", DL_MAX_FILE_MB)
+                        return None
+                    fh.write(chunk)
+    except Exception as exc:  # noqa: BLE001
+        log.error("[DL] download direto falhou: %s", exc)
+        return None
+    return dest
+
+
+async def _tiktok_via_api(
+    session: aiohttp.ClientSession, url: str, modo: str, tmpdir: str
+) -> str | None:
+    """TikTok SEM marca d'água via tikwm: hdplay/play p/ vídeo, music p/ áudio."""
+    try:
+        async with session.get(
+            _TIKWM_API,
+            params={"url": url, "hd": "1"},
+            timeout=aiohttp.ClientTimeout(total=20),
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as resp:
+            d = await resp.json(content_type=None)
+    except Exception as exc:  # noqa: BLE001
+        log.error("[DL] tikwm falhou: %s", exc)
+        return None
+    data = (d or {}).get("data") or {}
+    if modo == "audio":
+        alvo = data.get("music")
+        dest = os.path.join(tmpdir, "audio.mp3")
+    else:
+        alvo = data.get("hdplay") or data.get("play")
+        dest = os.path.join(tmpdir, "video.mp4")
+    if not alvo:
+        log.error("[DL] tikwm sem URL %s (code=%s)", modo, (d or {}).get("code"))
+        return None
+    baixado = await _download_direct(session, alvo, dest)
+    if not baixado:
+        return None
+    if modo == "audio":
+        baixado = await _to_voice_note(baixado) or baixado
+    return baixado
+
+
 async def _run_ytdlp(url: str, modo: str, tmpdir: str) -> str | None:
     """Baixa via yt-dlp; retorna caminho do arquivo ou None."""
     if modo == "audio":
@@ -1931,7 +1995,11 @@ async def _dl_execute(request: web.Request, jid: str, modo: str) -> None:
     await _try_send(request, jid, f"⏳ Baixando {modo} do {plataforma}...")
     tmpdir = tempfile.mkdtemp(prefix="wabot_dl_")
     try:
-        caminho = await _run_ytdlp(url, modo, tmpdir)
+        caminho = None
+        if plataforma == "tiktok":
+            caminho = await _tiktok_via_api(request.app["http"], url, modo, tmpdir)
+        if not caminho:
+            caminho = await _run_ytdlp(url, modo, tmpdir)
         if not caminho:
             await _try_send(request, jid, "❌ Não consegui baixar esse link. Pode ser privado, removido ou a plataforma bloqueou 😕")
             return
