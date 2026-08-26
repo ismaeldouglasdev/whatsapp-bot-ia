@@ -139,3 +139,20 @@ def test_serve_media_rota_segura():
     # valida as condicoes por inspecao do handler (sem subir servidor)
     src_handler = "t) != WEBHOOK_TOKEN" 
     assert True  # cobertura real via pytest de integracao abaixo
+
+
+def test_is_reply_to_bot():
+    """Quote de mensagem do bot = falando com ele (numero ou @lid)."""
+    own = "5511959873202@s.whatsapp.net"
+
+    def d(participant):
+        return {"message": {"extendedTextMessage": {
+            "text": "obrigado",
+            "contextInfo": {"participant": participant, "quotedMessage": {"conversation": "x"}},
+        }}}
+
+    assert bot._is_reply_to_bot(d("5511959873202@s.whatsapp.net"), own)
+    assert bot._is_reply_to_bot(d("5511959873202@lid"), own)
+    assert not bot._is_reply_to_bot(d("1199999999@s.whatsapp.net"), own)
+    assert not bot._is_reply_to_bot({"message": {"conversation": "oi"}}, own)
+    assert not bot._is_reply_to_bot(d(own), None)

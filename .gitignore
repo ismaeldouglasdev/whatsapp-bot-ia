@@ -13,3 +13,4 @@ __pycache__/
 📅_*
 state.json
 env.local
+quiz.db

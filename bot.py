@@ -810,6 +810,25 @@ async def get_own_jid(session: aiohttp.ClientSession) -> str | None:
     return _own_jid
 
 
+def _is_reply_to_bot(data: dict, own_jid: str | None) -> bool:
+    """Quote/reply a mensagem do proprio bot conta como falar com ele."""
+    if not own_jid:
+        return False
+    own_num = own_jid.split("@")[0]
+    msg = _unwrap_message(data.get("message") or {})
+    for keyname in ("extendedTextMessage", "imageMessage", "videoMessage", "documentMessage"):
+        node = msg.get(keyname)
+        if not isinstance(node, dict):
+            continue
+        ctx = node.get("contextInfo")
+        if not isinstance(ctx, dict):
+            continue
+        part = str(ctx.get("participant", ""))
+        if part and (part == own_jid or part.split("@")[0] == own_num):
+            return True
+    return False
+
+
 def _mentions_own_jid(data: dict, own_jid: str | None) -> bool:
     """Verifica menções em qualquer contextInfo (texto, legenda de mídia etc.)."""
     msg = _unwrap_message(data.get("message") or {})
@@ -2083,7 +2102,11 @@ async def handle_webhook(request: web.Request) -> web.Response:
             return web.json_response({"ok": True, "skipped": "group"})
         own = await get_own_jid(request.app["http"])
         comando_solto = bool(text) and text[0] in ".!"
-        if not comando_solto and not (_mentions_own_jid(data, own) or (mention_probe and _MENTION_TEXT_RE.search(mention_probe))):
+        if not comando_solto and not (
+            _mentions_own_jid(data, own)
+            or _is_reply_to_bot(data, own)
+            or (mention_probe and _MENTION_TEXT_RE.search(mention_probe))
+        ):
             msg_keys = list((data.get("message") or {}).keys())
             log.info("[grupo sem menção] %s: %r | msg_keys=%s", push_name, (text or "")[:60], msg_keys)
             return web.json_response({"ok": True, "skipped": "group-no-mention"})
