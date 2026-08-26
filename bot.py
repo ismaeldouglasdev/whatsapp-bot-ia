@@ -1492,6 +1492,7 @@ MENU_TEXT = (
     "▸ .dolar / .euro / .moedas — cotações\n"
     "▸ .clima <cidade> — tempo agora\n"
     "▸ .figtexto <texto> — figurinha de texto\n"
+    "▸ .dl <link> — baixa vídeo/áudio (menu) · .dlvideo / .dlaudio <link> direto\n"
     "▸ .ppt <pedra|papel|tesoura>\n"
     "▸ .velha — jogo da velha vs bot (`.velha <1-9>` pra jogar)\n"
     "▸ .forca — advinhe a palavra (`.forca <letra>`)\n"
@@ -2061,7 +2062,7 @@ async def _dl_handle(request: web.Request, jid: str, text: str) -> bool:
     return True
 
 
-async def _cmd_dl(request: web.Request, jid: str, args: str) -> None:
+async def _cmd_dl_impl(request: web.Request, jid: str, args: str, modo: str | None) -> None:
     if not args.strip():
         await _try_send(request, jid, "Uso: `.dl <link>` — TikTok, Instagram ou YouTube")
         return
@@ -2071,7 +2072,22 @@ async def _cmd_dl(request: web.Request, jid: str, args: str) -> None:
         return
     plataforma, url = det
     _DL_STATE[jid] = {"plataforma": plataforma, "url": url, "ts": time.time()}
-    await _try_send(request, jid, _dl_menu_send(plataforma))
+    if modo is None:
+        await _try_send(request, jid, _dl_menu_send(plataforma))
+    else:
+        await _dl_execute(request, jid, modo)
+
+
+async def _cmd_dl(request: web.Request, jid: str, args: str) -> None:
+    await _cmd_dl_impl(request, jid, args, None)
+
+
+async def _cmd_dlvideo(request: web.Request, jid: str, args: str) -> None:
+    await _cmd_dl_impl(request, jid, args, "video")
+
+
+async def _cmd_dlaudio(request: web.Request, jid: str, args: str) -> None:
+    await _cmd_dl_impl(request, jid, args, "audio")
 
 
 
@@ -2247,6 +2263,8 @@ COMMANDS: dict[str, CommandHandler] = {
     "resumo": _cmd_resumo,
     "traduz": _cmd_traduz,
     "dl": _cmd_dl,
+    "dlvideo": _cmd_dlvideo,
+    "dlaudio": _cmd_dlaudio,
     "lembrar": _cmd_lembrar,
     "piada": _cmd_piada,
 }

@@ -35,3 +35,8 @@ def test_dl_state_expira():
 def test_dl_menu_formato():
     msg = bot._dl_menu_send("tiktok")
     assert "TikTok" in msg and "1" in msg and "2" in msg
+
+
+def test_comandos_dl_registrados():
+    for cmd in ("dl", "dlvideo", "dlaudio"):
+        assert bot.COMMANDS.get(cmd), f"comando {cmd} ausente no COMMANDS"
