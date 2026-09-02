@@ -1,0 +1,22 @@
+{
+  "event": "messages.upsert",
+  "instance": "bot_ia",
+  "data": {
+    "key": {
+      "remoteJid": "5511959873202@s.whatsapp.net",
+      "fromMe": false,
+      "id": "ABC123"
+    },
+    "pushName": "Teste",
+    "message": {
+      "conversation": "oi bot"
+    },
+    "messageType": "conversation",
+    "messageTimestamp": 1754250000
+  },
+  "destination": "bot_ia",
+  "date_time": "2026-08-24T12:00:00.000Z",
+  "sender": "5511959873202",
+  "server_url": "http://localhost:8083",
+  "apikey": "test-key"
+}

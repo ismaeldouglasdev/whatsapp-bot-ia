@@ -1,16 +1,20 @@
 # Segredos — NUNCA commitar
 .env
+*.bak
+*.bak-*
 *.key
 cookies.txt
 
 # Runtime
 bot.log
 qr_bot_ia.png
+qr_whatsapp.png
 __pycache__/
 *.pyc
 
 # Lembretes locais
 📅_*
 state.json
+state.json.*
 env.local
 quiz.db
