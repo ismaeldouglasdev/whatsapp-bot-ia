@@ -45,7 +45,7 @@ except ImportError as _pil_exc:  # pragma: no cover
 # Configuração
 # ---------------------------------------------------------------------------
 EVOLUTION_URL = os.environ.get("EVOLUTION_URL", "http://localhost:8083")
-EVOLUTION_API_KEY = os.environ.get("EVOLUTION_API_KEY", "evolution_bot_2026_key")
+EVOLUTION_API_KEY = os.environ.get("EVOLUTION_API_KEY", "CHANGE_ME")
 INSTANCE = os.environ.get("EVOLUTION_INSTANCE", "bot_ia")
 
 AI_URL = os.environ.get("AI_URL", "http://localhost:20131/v1/chat/completions")

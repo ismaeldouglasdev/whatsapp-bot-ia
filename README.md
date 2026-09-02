@@ -52,7 +52,7 @@ systemctl --user daemon-reload && systemctl --user enable --now whatsapp-bot
 | Var | Default | Descrição |
 |---|---|---|
 | `EVOLUTION_URL` | `http://localhost:8083` | Endereço da Evolution API |
-| `EVOLUTION_API_KEY` | `evolution_bot_2026_key` | apikey da Evolution |
+| `EVOLUTION_API_KEY` | `CHANGE_ME` | apikey da Evolution (obrigatória — setar via env.local) |
 | `EVOLUTION_INSTANCE` | `bot_ia` | Nome da instância |
 | `AI_URL` | `http://localhost:20131/v1/chat/completions` | Endpoint OpenAI-compatível |
 | `AI_MODEL` | `9router/ollama/gpt-oss:120b` | Modelo de resposta |
