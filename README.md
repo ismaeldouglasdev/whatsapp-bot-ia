@@ -123,6 +123,12 @@ docker compose ps                        # containers
 curl localhost:8084/health               # healthcheck do bot
 ```
 
+## Operações (parar / reativar)
+
+Para **parar** o bot completamente (número caiu, manutenção) ou **reativá-lo**
+após pausa, siga o guia em [`OPERATIONS.md`](OPERATIONS.md) — passo a passo de
+parada/retomada, ordem de subida dos containers, repareamento do número e logs.
+
 ## Licença
 
 MIT
